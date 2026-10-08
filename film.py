@@ -1,728 +1,1082 @@
-"""Render: .venv/bin/manim -qh film.py PathfindingFilm
-Set CHAPTER_SELECTION=0,6,10 to render selected chapters for review.
+"""The film — silent, subtitled, one character per scene. 22 scenes.
+
+Scenes in `ORDER`; every subtitle is paired with its own animation in a single
+`beat(text, fn)`. Subtitles are timed by syllable count (`syllables()/SPS`).
+
+Render (from romania-video):
+    ./render.sh                    # whole film
+    ./render.sh scenes             # one mp4 per scene
+    SCENES=sc_race .venv/bin/python -m manim -qh film.py Film   # one scene
 """
-import json
 import os
+import re
+import sys
 from pathlib import Path
+
 import numpy as np
-from manim import *
-from storyboard import CHAPTERS
 
 ROOT = Path(__file__).resolve().parent
-DATA = json.loads((ROOT/'project_data.json').read_text())
-INK, MUTED = '#F4F1EA', '#C4C1B9'
-CYAN, GOLD, GREEN, PURPLE, RED = '#55D6BE', '#F2C14E', '#8BE28B', '#B39DDB', '#F07167'
-config.background_color = '#101010'
-config.frame_width = 16
-config.frame_height = 9
+sys.path.insert(0, str(ROOT))
+from scene_kit import RoadMap, DATA, label, INK, MUTED, CYAN, GOLD, GREEN, PURPLE, RED  # noqa: E402
+from manim import *  # noqa: E402
+
+FONT = 'Avenir Next'
+CHAR = ROOT.parent / 'assets' / 'Character'
+MAXW = 11.8
+AUDIT = bool(os.environ.get('AUDIT'))
 
 
-def label(text, size=25, color=INK, width=None):
-    # Shape at a constant large size to reduce small-font positioning
-    # quantization. The fixed scale preserves the requested font size;
-    # it never depends on the length of the string.
-    def typeset(value):
-        return Text(value, font='Avenir Next', font_size=200,
-                    color=color, disable_ligatures=True).scale(size / 200)
+def km(a, b):
+    return next(e['km'] for e in DATA['graph'][a]['edges'] if e['to'] == b)
 
-    if width:
-        lines = []
-        for paragraph in text.split('\n'):
-            line = ''
-            for word in paragraph.split():
-                candidate = f'{line} {word}' if line else word
-                if line and typeset(candidate).width > width:
-                    lines.append(line)
-                    line = word
+
+def syllables(text):
+    """Rough English syllable count: vowel groups, minus a silent final 'e'.
+
+    Subtitle timing is driven by this instead of word count, so a line of long
+    words holds longer than a line of short ones at the same word count.
+    """
+    n = 0
+    for w in re.findall(r'[a-zA-Z]+', text.lower()):
+        groups = len(re.findall(r'[aeiouy]+', w))
+        if groups > 1 and w.endswith('e'):
+            groups -= 1
+        n += max(1, groups)
+    return n
+
+
+def subtitle(text, size=28):
+    one = label(text, size, INK)
+    if one.width <= MAXW:
+        lines = [text]
+    else:
+        w = text.split()
+        best, bw = None, 1e9
+        for i in range(1, len(w)):
+            a, b = ' '.join(w[:i]), ' '.join(w[i:])
+            x = max(label(a, size, INK).width, label(b, size, INK).width)
+            if x < bw:
+                best, bw = (a, b), x
+        lines = list(best)
+    body = VGroup(*[label(l, size, INK) for l in lines]).arrange(DOWN, buff=0.14)
+    box = SurroundingRectangle(body, color=BLACK, fill_color=BLACK, fill_opacity=0.6,
+                               stroke_width=0, buff=0.20)
+    return VGroup(box, body).to_edge(DOWN, buff=0.95)
+
+
+def split_line(p, q, c1, c2, stroke=7, gap=0.045):
+    d = np.array(q) - np.array(p)
+    n = np.array([-d[1], d[0], 0.0])
+    n = n / (np.linalg.norm(n) + 1e-9) * gap
+    return VGroup(Line(p + n, q + n, color=c1, stroke_width=stroke),
+                  Line(p - n, q - n, color=c2, stroke_width=stroke))
+
+
+def code_panel(src, width=7.6, fs=17, lines=0.52, lang='typescript'):
+    """A syntax-highlighted code card, sized to a fixed width."""
+    return Code(code_string=src, language=lang, formatter_style='monokai',
+                background='rectangle',
+                background_config={'stroke_width': 0, 'fill_color': BLACK, 'fill_opacity': 0},
+                add_line_numbers=False,
+                paragraph_config={'font': 'Menlo', 'font_size': fs, 'line_spacing': lines}
+                ).scale_to_fit_width(width)
+
+
+def card(text, color, w=3.2, h=0.46, size=18, fill=None):
+    r = RoundedRectangle(corner_radius=0.09, width=w, height=h, stroke_color=color,
+                         stroke_width=2, fill_color=BLACK, fill_opacity=0.0)
+    return VGroup(r, label(text, size, color).move_to(r))
+
+
+def hl_lines(code, i0, i1, color=GOLD):
+    return VGroup(*[SurroundingRectangle(code.code_lines[i], color=color,
+                                         buff=0.045, stroke_width=2)
+                    for i in range(i0, i1 + 1)])
+
+
+def tag(text, size, color):
+    """A map annotation. No background plate (only subtitles may be filled),
+    so callers must place these clear of the geometry they label."""
+    return label(text, size, color)
+
+
+UCS_SRC = """\
+while (frontier.length > 0) {
+  frontier.sort((a, b) => a.cost - b.cost)
+  const { id, cost } = frontier.shift()
+
+  for (const edge of ROMANIA[id].edges) {
+    const nc = cost + edge.km
+    if (nc < reached[edge.to]) {
+      reached[edge.to] = nc
+      parent[edge.to] = id
+      frontier.push({ id: edge.to, cost: nc })
+    }
+  }
+}"""
+
+ASTAR_SRC = """\
+while (frontier.length > 0) {
+  let bestI = 0
+  for (let i = 1; i < frontier.length; i++)
+    if (frontier[i][0] < frontier[bestI][0]) bestI = i
+
+  const [f, g, current] = frontier[bestI]
+
+  if (g > bestG[current]) continue    // stale copy
+
+  for (const edge of ROMANIA[current].edges) {
+    const ng = g + edge.km
+    frontier.push([ng + h(edge.to, goal), ng, edge.to])
+  }
+}"""
+
+BOUNDS_SRC = """\
+function h(node, goal) {
+  const lp = HEURISTIC_TABLE[node + "|" + goal]
+
+  let alt = 0
+  for (const L of landmarks) {
+    const d = Math.abs(dist[L][node] - dist[L][goal])
+    if (d > alt) alt = d
+  }
+
+  return Math.max(lp, alt)   // never overshoots
+}"""
+
+LINPROG_SRC = """\
+def lp_value(a, b):
+    ca, cb = coords[a], coords[b]
+    res = linprog(
+        edge_costs,                        # km per arrow
+        A_eq=[xs, ys],                     # sum alpha*vec = chord
+        b_eq=[cb[0] - ca[0], cb[1] - ca[1]],
+        bounds=[(0, 1)] * len(edge_costs),
+        method="highs",
+    )
+    return res.fun"""
+
+BOTH_SRC = """\
+while (frontF.length > 0 && frontB.length > 0) {
+  if (Math.max(minF(frontF), minF(frontB)) >= mu) break
+
+  // every expansion can improve the best route mu
+  if (u in gOther) {
+    const candidate = gu + gOther[u]
+    if (candidate < mu) { mu = candidate; muNode = u }
+  }
+}"""
+
+
+ORDER = ['sc_route', 'sc_explore', 'sc_ucsproof', 'sc_estimate', 'sc_twoways', 'sc_lpproof',
+         'sc_triangle', 'sc_landmark', 'sc_max', 'sc_tightness', 'sc_code_search', 'sc_code_astar',
+         'sc_code_bounds', 'sc_code_table', 'sc_code_both', 'sc_race', 'sc_cutwork',
+         'sc_complexity', 'sc_guarantee', 'sc_bothends', 'sc_stop', 'sc_recap']
+WHO = {'sc_route': ['Bird'], 'sc_explore': ['Bird'], 'sc_ucsproof': ['Bird'], 'sc_estimate': ['Bird'],
+       'sc_twoways': ['Whale'], 'sc_lpproof': ['Whale'], 'sc_triangle': ['Whale'], 'sc_landmark': ['Whale'],
+       'sc_max': ['Bird', 'Whale'],
+       'sc_tightness': ['Whale'], 'sc_code_search': ['Whale'], 'sc_code_astar': ['Whale'],
+       'sc_code_bounds': ['Whale'], 'sc_code_table': ['Whale'], 'sc_code_both': ['Whale'],
+       'sc_race': ['Whale'], 'sc_cutwork': ['Bread'], 'sc_complexity': ['Bread'],
+       'sc_guarantee': ['Bread'], 'sc_bothends': ['Bread'], 'sc_stop': ['Bread'], 'sc_recap': ['Bread']}
+
+
+class Film(Scene):
+    K = 1.3       # global slowdown factor for animations
+    BEAT = 0.4    # pause right after a subtitle appears
+    SPS = 4.2     # syllables per second -> each block's hold (calm 3b1b pace)
+    MIN_HOLD = 0.8
+    END = 1.1     # hold on a scene's final frame
+
+    def play(self, *animations, **kwargs):
+        if 'run_time' in kwargs:
+            kwargs['run_time'] = kwargs['run_time'] * self.K
+        return super().play(*animations, **kwargs)
+
+    def wait(self, duration=DEFAULT_WAIT_TIME, stop_condition=None, frozen_frame=None):
+        # Manim freezes the frame during a plain wait and, in doing so, stops
+        # ticking mobject updaters. That would freeze the mascot and every loop
+        # token between beats, so force updaters to keep running during holds.
+        if AUDIT and duration >= 0.35:
+            self._audit()
+        return super().wait(duration, stop_condition=stop_condition, frozen_frame=False)
+
+    def _audit(self):
+        """Accumulate settled-frame collisions between text and graphics.
+
+        Runs at the start of every substantial hold, i.e. exactly the frames the
+        viewer reads. Text is compared against leaf geometry (lines, arrows,
+        chips, ...) so large container groups do not produce meaningless hits;
+        intentional text-on-node cases (map initials over their Dot) are
+        excluded. Character (image) collisions are tracked separately.
+        """
+        try:
+            from manim.mobject.text.text_mobject import Text as _T
+        except Exception:
+            return
+        shapes = (Line, Arrow, Rectangle, RoundedRectangle, Circle, Polygon,
+                  Triangle, Star, DashedLine, Arc, Square)
+        texts, gr = [], []
+        for m in self.mobjects:
+            if m is self._sub or isinstance(m, Code):
+                continue
+            fam = m.get_family()
+            if isinstance(m, ImageMobject):
+                gr.append(('CHARACTER', m))
+                continue
+            t = [x for x in fam if isinstance(x, _T) and not getattr(x, 'map_label', False)]
+            if t:
+                texts.extend((getattr(x, 'text', '?'), x) for x in t)
+                continue
+            gr.extend((type(x).__name__, x) for x in fam
+                      if isinstance(x, shapes) and not isinstance(x, Dot))
+
+        def box(m):
+            return (m.get_left()[0], m.get_right()[0], m.get_bottom()[1], m.get_top()[1])
+
+        def area(a):
+            return max((a[1] - a[0]) * (a[3] - a[2]), 1e-6)
+
+        def shrink(a, f=0.08):
+            dx, dy = (a[1] - a[0]) * f, (a[3] - a[2]) * f
+            return (a[0] + dx, a[1] - dx, a[2] + dy, a[3] - dy)
+
+        def crosses_rect(gm, r):
+            """True if geometry actually passes through the rect (sample the
+            path densely), not merely if bounding boxes overlap."""
+            P = gm.get_all_points()
+            if len(P) == 0:
+                return False
+            pts = list(P)
+            for a, b in zip(P, P[1:]):
+                for t in np.linspace(0, 1, 6)[1:-1]:
+                    pts.append(a + (b - a) * t)
+            return any(r[0] < p[0] < r[1] and r[2] < p[1] < r[3] for p in pts)
+
+        for txt, tm in texts:
+            tr = shrink(box(tm))
+            for gt, gm in gr:
+                if gt == 'CHARACTER':
+                    continue
+                if isinstance(gm, (Rectangle, RoundedRectangle, Square)):
+                    gb = box(gm)
+                    hit = (tr[0] < gb[0] and tr[1] > gb[1] and tr[2] < gb[2] and tr[3] > gb[3])
+                    hit = bool(hit) or crosses_rect(gm, tr)
                 else:
-                    line = candidate
-            lines.append(line)
-        text = '\n'.join(lines)
-    # Lay out complete lines explicitly. This avoids baseline collisions
-    # between wrapped and manually separated lines in Pango.
-    lines = text.split('\n')
-    if len(lines) == 1:
-        return typeset(text)
-    return VGroup(*[typeset(line) for line in lines if line]).arrange(
-        DOWN, aligned_edge=LEFT, buff=size*.007)
-
-
-def subscript(base, sub, size=28, color=INK):
-    """Font-safe visual subscript, avoiding missing Unicode glyphs."""
-    main = label(base, size, color)
-    small = label(sub, size * .52, color)
-    small.next_to(main, DOWN * .18 + RIGHT * .03, buff=0)
-    return VGroup(main, small)
-
-
-def formula(kind, equation):
-    """Use semantic color tokens instead of coloring every formula cyan."""
-    if kind in ('ucs', 'ucstrace', 'ucsproof'):
-        return VGroup(label('priority(n) = ', 30, INK), label('g(n)', 30, PURPLE))
-    if kind == 'astar':
-        return VGroup(label('f(n)', 30, GREEN), label(' = ', 30, INK), label('g(n)', 30, PURPLE), label(' + ', 30, INK), label('h(n,t)', 30, GOLD))
-    if kind in ('lp', 'lpproof'):
-        return VGroup(label('min ', 30, INK), label('Σ αᵢ cᵢ', 30, GOLD), label('   subject to   ', 30, INK), label('Σ αᵢ vᵢ = Δ', 30, CYAN))
-    if kind == 'alt':
-        return VGroup(subscript('h', 'ALT', 27, GOLD), label('(n,t) = max over L of ', 27, GOLD), label('|d(L,n) − d(L,t)|', 27, INK))
-    if kind == 'triangle':
-        # Keep the signed-distance terms semantically colored while the
-        # absolute-value and subtraction operators remain neutral.
-        return VGroup(
-            label('|', 28, INK), label('d(L,n)', 28, CYAN),
-            label(' − ', 28, INK), label('d(L,t)', 28, GOLD),
-            label('| ≤ ', 28, INK), label('d(n,t)', 28, GREEN),
-        ).arrange(RIGHT, buff=.03)
-    if kind == 'leaf':
-        return VGroup(label('d(Giurgiu,n) − 90', 28, GOLD), label(' = ', 28, INK), label('d(Bucharest,n)', 28, GREEN))
-    if kind == 'combine':
-        return VGroup(label('h = max(', 29, INK), subscript('h', 'LP', 29, PURPLE), label(', ', 29, INK), subscript('h', 'ALT', 29, GOLD), label(')', 29, INK), label('  ≤  d', 29, GREEN))
-    if kind == 'stop':
-        return VGroup(label('max(', 29, INK), label('min fF', 29, CYAN), label(', ', 29, INK), label('min fB', 29, GOLD), label(')  ≥ ', 29, INK), label('μ', 29, GREEN))
-    if kind == 'consistency':
-        return VGroup(label(equation, 28, CYAN, width=6.6))
-    return VGroup(label(equation, 28, CYAN, width=6.6))
-
-
-def example(start='Arad',goal='Bucharest',preset='lm8'):
-    return next(p for p in DATA['variants'][preset]['pairs'] if p['s']==start and p['t']==goal)
-
-
-class RoadMap(VGroup):
-    def __init__(self, width=6.8, center=LEFT*3.9+DOWN*.2, initials=False):
-        super().__init__()
-        self.points_by_city = {}
-        self.nodes, self.roads = {}, {}
-        self.city_labels = {}
-        for city, item in DATA['graph'].items():
-            self.points_by_city[city] = np.array([(item['x']-2043)/2540*width, -(item['y']-1254)/2540*width, 0])+center
-        for city, item in DATA['graph'].items():
-            for edge in item['edges']:
-                if city < edge['to']:
-                    road = Line(self.points_by_city[city],self.points_by_city[edge['to']],color='#53627A',stroke_width=2.4)
-                    self.roads[frozenset([city,edge['to']])] = road
-                    self.add(road)
-        for city, point in self.points_by_city.items():
-            node = Dot(point,radius=.16 if initials else .068,color=MUTED).set_z_index(3)
-            self.nodes[city] = node
-            self.add(node)
-            name = 'Rimnicu V.' if city=='Rimnicu Vilcea' else city
-            city_label = label(name,16).next_to(node, DOWN if city in ['Arad','Sibiu','Fagaras','Hirsova','Giurgiu','Craiova','Eforie'] else UP,buff=.065)
-            city_label.add_background_rectangle(color='#101010', opacity=1, buff=.035)
-            if initials:
-                city_label = label(city[0],16,'#101010').move_to(node)
-            city_label.set_z_index(10)
-            self.add(city_label)
-            self.city_labels[city] = city_label
-
-    def route(self, cities, color=GREEN):
-        return VGroup(*[Line(self.points_by_city[a],self.points_by_city[b],color=color,stroke_width=5) for a,b in zip(cities,cities[1:])])
-
-
-class PathfindingFilm(Scene):
-    """A question leads to a demonstration, then a name or equation."""
+                    hit = crosses_rect(gm, tr)
+                if hit:
+                    key = ('TEXT', txt[:30], gt)
+                    self._hits[key] = max(self._hits.get(key, 0.0), round(area(tr) / area(box(tm)), 2))
+        # character vs text (both are blobs, so bounding boxes are the right test)
+        for gt, gm in gr:
+            if gt != 'CHARACTER':
+                continue
+            cb = box(gm)
+            for txt, tm in texts:
+                tb = box(tm)
+                w = min(cb[1], tb[1]) - max(cb[0], tb[0])
+                h = min(cb[3], tb[3]) - max(cb[2], tb[2])
+                if w > 0.04 and h > 0.04:
+                    key = ('CHARACTER', 'x', f'TEXT "{txt[:24]}"')
+                    self._hits[key] = max(self._hits.get(key, 0.0), round(w * h / area(cb), 2))
 
     def construct(self):
-        selected = os.environ.get('CHAPTER_SELECTION')
-        indices = [int(v) for v in selected.split(',')] if selected else list(range(len(CHAPTERS)))
-        self.note = None
-        self.vector_diagram = None
-        timeline = []
-        for index in indices:
-            start = self.time
-            title, kind, _, _, narration = CHAPTERS[index]
-            self.begin(index, title)
-            getattr(self, kind)()
-            self.wait(2.4)
-            # Keep exactly the same vector arrows between explanation and proof.
-            keep = self.vector_diagram if kind == 'lp' and index + 1 in indices else None
-            outgoing = [m for m in self.mobjects if m is not keep]
-            self.play(*[FadeOut(m) for m in outgoing], run_time=.5)
-            self.note = None
-            timeline.append(dict(index=index + 1, kind=kind, title=title,
-                                 start=round(start, 3), duration=round(self.time-start, 3),
-                                 narration=narration))
-        if not selected:
-            (ROOT/'timeline.json').write_text(json.dumps(timeline, indent=2))
-            (ROOT/'narration.md').write_text(
-                '# Human narrator script\n\nCompanion to the silent video. '
-                'These chapter times come from the animation, not recorded speech.\n\n' +
-                '\n\n'.join(f'## {c["index"]:02} · {c["title"]}\n\n'
-                             f'Start: {c["start"]:.2f}s · Visual duration: {c["duration"]:.2f}s\n\n'
-                             f'{c["narration"]}' for c in timeline))
+        self._sub = None
+        self._scene = '?'
+        names = os.environ.get('SCENES', '').split(',') if os.environ.get('SCENES') else ORDER
+        for name in names:
+            self._sub = None
+            self._scene = name
+            self._hits = {}
+            self._speaker(WHO[name])
+            getattr(self, name)()
+            if AUDIT and self._hits:
+                print(f'[AUDIT {name}] {len(self._hits)} collision types')
+                for (kind, what, gt), frac in sorted(self._hits.items(), key=lambda kv: -kv[1])[:12]:
+                    print(f'    {frac:4.2f} frac  {kind:9s} "{what}"  x  {gt}')
+            self.wait(self.END)
+            self.play(*[FadeOut(m) for m in self.mobjects], run_time=0.3)
 
-    def begin(self, index, title):
-        counter = label(f'{index+1:02} / {len(CHAPTERS):02}', 16, MUTED).to_corner(UL, buff=.55)
-        self.add(counter)
-        self.add(label(title, 36, width=14.5).next_to(counter, DOWN, aligned_edge=LEFT, buff=.28))
+    # ── helpers ───────────────────────────────────────────────────────────────
+    def _speaker(self, who):
+        self.mc = None
+        xs = [LEFT * 6.55, LEFT * 5.75]
+        for i, name in enumerate(who):
+            m = ImageMobject(str(CHAR / f'cast_{name}.png')).set_z_index(20)
+            m.scale_to_fit_height(0.72)
+            m.move_to(xs[i] + DOWN * 2.75)
+            base = m.get_center().copy()
+            m.add_updater(lambda mm, b=base: mm.move_to(
+                b + UP * 0.20 * np.sin(self.time * 2.3) + RIGHT * 0.12 * np.sin(self.time * 3.5)))
+            self.add(m)
+            if self.mc is None:
+                self.mc = m
 
-    def panel(self, mob, hold=2.5):
-        """One idea at a time, below the reserved title band."""
-        mob.move_to(RIGHT*3.65+UP*.4)
-        if mob.width > 6.6 or mob.get_top()[1] > 2.6 or mob.get_bottom()[1] < -2.8:
-            raise ValueError('Explanation exceeds the reserved panel bounds')
-        if self.note is not None:
-            self.play(FadeOut(self.note), run_time=.3)
-        self.play(FadeIn(mob), run_time=.5)
-        self.note = mob
+    def sub(self, text):
+        s = subtitle(text)
+        if self._sub is not None:
+            self.play(FadeOut(self._sub), run_time=0.2)
+        self.play(FadeIn(s, shift=UP * 0.06), run_time=0.25)
+        self._sub = s
+        self.wait(self.BEAT)
+
+    def beat(self, text, fn=None, hold=None):
+        self.sub(text)
+        if fn is not None:
+            fn()
+        if hold is None:
+            hold = max(self.MIN_HOLD, syllables(text) / self.SPS)
         self.wait(hold)
-        return mob
 
-    def say(self, text, color=INK, size=27):
-        return self.panel(label(text, size, color, width=6.3),
-                          hold=max(2, min(4.5, len(text.split()) / 3)))
+    def title(self, text):
+        self.add(label(text, 30, INK).to_corner(UL, buff=0.5))
 
-    def equation(self, kind, text=''):
-        parts = formula(kind, text)
-        rows, row = [], VGroup()
-        for part in list(parts):
-            if len(row) and sum(p.width for p in row) + .08*len(row) + part.width > 6.3:
-                rows.append(row.arrange(RIGHT, buff=.08))
-                row = VGroup()
-            row.add(part)
-        if len(row):
-            rows.append(row.arrange(RIGHT, buff=.08))
-        self.panel(VGroup(*rows).arrange(DOWN, buff=.25), hold=3)
+    def diagram(self, width=7.2, center=LEFT * 3.0 + UP * 0.2):
+        d = RoadMap(width=width, center=center, initials=True)
+        self.play(FadeIn(d), run_time=0.6)
+        return d
 
-    def map(self):
-        diagram = RoadMap(width=6.2, center=LEFT*3.5+DOWN*.1, initials=True)
-        self.play(FadeIn(diagram), run_time=.8)
-        return diagram
+    def counter(self, caption, color, pos, unit=""):
+        if caption:
+            self.add(label(caption, 20, MUTED).move_to(pos + UP * 0.42))
+        tr = ValueTracker(0)
+        txt = Text(f"0{unit}", font=FONT, font_size=38, color=color).move_to(pos)
+        txt.add_updater(lambda m: m.become(
+            Text(f"{int(round(tr.get_value()))}{unit}", font=FONT, font_size=38, color=color).move_to(pos)))
+        self.add(txt)
+        return tr
 
-    def compact_labels(self, diagram):
-        # Move the existing first glyph into the node; fade only the suffix.
-        # This keeps letter shapes intact throughout the smooth transition.
-        animations, replacements = [], []
-        for city, old in diagram.city_labels.items():
-            background = old.background_rectangle
-            old.remove(background)
-            self.remove(background)
-            first, suffix = old[0], VGroup(*old[1:])
-            initial = label(city[0],16,'#101010').move_to(diagram.nodes[city]).set_z_index(10)
-            animations.extend([Transform(first, initial), FadeOut(suffix),
-                               diagram.nodes[city].animate.scale(.16/.068)])
-            replacements.append((city, old, first, suffix, initial))
-        self.play(*animations, run_time=1.2, rate_func=smooth)
-        for city, old, first, suffix, initial in replacements:
-            self.remove(old, first, suffix)
-            diagram.remove(old)
-            diagram.add(initial)
-            diagram.city_labels[city] = initial
-        self.add(diagram)
+    def bar(self, value, y, color, text, scale, x0=-6.4, rt=0.5):
+        b = Rectangle(width=max(value * scale, 1e-3), height=0.34, fill_color=color,
+                      fill_opacity=0.95, stroke_width=0).move_to([x0 + value * scale / 2, y, 0])
+        t = label(text, 20, color).next_to(b, UP, buff=0.06).align_to(b, LEFT)
+        self.play(GrowFromEdge(b, LEFT), FadeIn(t), run_time=rt)
+        return b, t
 
-    def draw_route(self, diagram, route, color=GREEN, seconds=.45):
-        lines = VGroup()
-        for a, b in zip(route, route[1:]):
-            line = Line(diagram.points_by_city[a], diagram.points_by_city[b],
-                        color=color, stroke_width=5).set_z_index(1)
-            lines.add(line)
-            self.play(Create(line), run_time=seconds)
-        self.add(lines)
-        return lines
+    def token(self, points, color, speed=1.6, r=0.1):
+        """A dot that loops forever along a polyline — keeps a beat's diagram alive.
 
-    def journey(self):
-        diagram = RoadMap(width=6.2, center=LEFT*3.5+DOWN*.1)
-        endpoints = [diagram.nodes[c] for c in ('Arad', 'Bucharest')]
-        names = [diagram.city_labels[c] for c in ('Arad', 'Bucharest')]
-        self.play(*[FadeIn(m) for m in endpoints+names], run_time=.7)
-        self.say('You are in Arad.\nYou want to reach Bucharest.')
-        # Introduce the road network only after establishing the journey.
-        rest = VGroup(*[m for m in diagram if m not in endpoints+names])
-        self.play(FadeIn(rest), run_time=1)
-        self.add(diagram)
-        self.say('There is more than one way to go.')
-        self.wait(1)
-        self.compact_labels(diagram)
-        self.wait(1)
-        first = self.draw_route(diagram, ['Arad','Sibiu','Fagaras','Bucharest'], GOLD)
-        self.wait(1)
-        self.play(FadeOut(first), run_time=.4)
-        self.draw_route(diagram, ['Arad','Sibiu','Rimnicu Vilcea','Pitesti','Bucharest'], PURPLE)
-        self.say('Which route has the smallest total distance?')
+        Uses move_to only, so the dot's opacity is untouched and the scene-end
+        FadeOut still works without clearing updaters.
+        """
+        pts = [np.array(p, dtype=float) for p in points]
+        segs = list(zip(pts, pts[1:]))
+        lens = [np.linalg.norm(b - a) for a, b in segs]
+        tot = sum(lens)
+        d = Dot(pts[0], radius=r, color=color).set_z_index(7)
 
-    def routes(self):
-        totals = []
-        paths = [(['Arad','Sibiu','Fagaras','Bucharest'], GOLD, 1.15),
-                 (['Arad','Sibiu','Rimnicu Vilcea','Pitesti','Bucharest'], PURPLE, -1.15)]
-        for path, color, y in paths:
-            points = [np.array([x,y,0]) for x in np.linspace(-6.8,-.5,len(path))]
-            names = VGroup(*[label('Rimnicu V.' if c=='Rimnicu Vilcea' else c, 14)
-                             .next_to(p, UP, buff=.22) for c,p in zip(path,points)])
-            self.play(FadeIn(names), run_time=.5)
-            costs = []
-            for a,b,p,q in zip(path,path[1:],points,points[1:]):
-                cost = next(e['km'] for e in DATA['graph'][a]['edges'] if e['to']==b)
-                costs.append(cost)
-                self.play(Create(Line(p,q,color=color,stroke_width=5)),
-                          FadeIn(label(str(cost),18,color).move_to((p+q)/2+DOWN*.28)),run_time=.55)
-            total = label(f'{len(costs)} roads\n'+' + '.join(map(str,costs))+f' = {sum(costs)} km',
-                          25, color, width=6.3).move_to(RIGHT*3.65+UP*(.4 if not totals else -.85))
-            self.play(FadeIn(total), run_time=.5)
-            self.wait(2.5)
-            if not totals:
-                self.play(total.animate.shift(UP*.9), run_time=.65, rate_func=smooth)
-            totals.append(total)
-        self.wait(2)
-        self.play(*[FadeOut(total) for total in totals], run_time=.5)
-        self.say('Four roads can be shorter than three.')
-        self.say('Can we find the best route systematically?')
+        def upd(m):
+            x = (self.time * speed) % tot
+            for (a, b), ln in zip(segs, lens):
+                if x <= ln:
+                    m.move_to(a + (b - a) * (x / ln))
+                    return
+                x -= ln
+        d.add_updater(upd)
+        return d
 
-    def ucs(self):
-        diagram = self.map()
-        ex = example()
-        self.say('Start at zero.\nExtend the cheapest discovered route.')
-        costs, tree = {ex['s']: 0}, {}
-        for step in ex['ucs']['steps']:
-            current = step['current']
-            self.play(Indicate(diagram.nodes[current], color=PURPLE, scale_factor=1.4),run_time=.25)
-            if current != ex['t']:
-                for edge in DATA['graph'][current]['edges']:
-                    neighbor = edge['to']
-                    cost = costs[current]+edge['km']
-                    if cost < costs.get(neighbor,float('inf')):
-                        costs[neighbor] = cost
-                        line = Line(diagram.points_by_city[current],diagram.points_by_city[neighbor],
-                                    color=PURPLE,stroke_width=5).set_z_index(1)
-                        changes = [Create(line), diagram.nodes[neighbor].animate.set_color(CYAN)]
-                        if neighbor in tree:
-                            changes.append(FadeOut(tree[neighbor]))
-                        self.play(*changes,run_time=.35)
-                        tree[neighbor] = line
-            self.play(diagram.nodes[current].animate.set_color(PURPLE),run_time=.15)
-        self.draw_route(diagram, ex['ucs']['path'])
-        self.say('418 km.\nThe goal is now selected at minimum cost.', GREEN)
-        self.say('This is uniform cost search.\nUCS', PURPLE)
-        self.equation('ucs')
-        self.say('g is the cost already paid.', PURPLE)
+    # ── scenes ────────────────────────────────────────────────────────────────
+    def sc_route(self):
+        self.title('Which route is cheapest?')
+        r1 = ['Arad', 'Sibiu', 'Fagaras', 'Bucharest']
+        r2 = ['Arad', 'Sibiu', 'Rimnicu Vilcea', 'Pitesti', 'Bucharest']
+        box, drawn = {}, {}
 
-    def ucsproof(self):
-        positions = [LEFT*6.5, LEFT*4, LEFT*1.5]
-        for p,name in zip(positions,['start','frontier','goal']):
-            self.add(Dot(p,color=PURPLE),label(name,20).next_to(p,DOWN,buff=.25))
-        self.play(Create(Line(positions[0],positions[1],color=PURPLE,stroke_width=5)),run_time=.7)
-        self.say('Suppose the selected goal hides a cheaper route.')
-        self.play(Create(DashedLine(positions[1],positions[2],color=GREEN)),run_time=.7)
-        self.say('That route must cross the frontier.')
-        self.play(Indicate(Dot(positions[1],color=GREEN),color=GREEN),run_time=.7)
-        self.say('With nonnegative road costs, its frontier cost would be smaller.')
-        self.say('UCS would have selected it first.\nThat is the contradiction.', GREEN)
+        def start():
+            box['d'] = self.diagram()
+            self.play(Indicate(box['d'].nodes['Arad'], color=GREEN),
+                      Indicate(box['d'].nodes['Bucharest'], color=RED), run_time=0.6)
+        self.beat("From Arad, we want to reach Bucharest.", start)
 
-    def waste(self):
-        diagram = self.map()
-        self.draw_route(diagram,['Arad','Timisoara','Lugoj'],PURPLE)
-        self.draw_route(diagram,['Arad','Zerind','Oradea'],PURPLE)
-        self.say('Cheap first steps can lead away from our final route.')
-        self.draw_route(diagram,example()['ucs']['path'],GREEN)
-        self.say('UCS knows the cost so far.\nIt does not estimate the rest.')
-        self.say('Could the destination guide the search?', GOLD)
+        def gold():
+            t1 = self.counter("", GOLD, RIGHT * 3.4 + UP * 1.1, unit=" km")
+            tot = 0
+            for a, b in zip(r1, r1[1:]):
+                tot += km(a, b)
+                mob = Line(box['d'].points_by_city[a], box['d'].points_by_city[b], color=GOLD, stroke_width=7).set_z_index(2)
+                drawn[frozenset((a, b))] = mob
+                self.play(Create(mob), t1.animate.set_value(tot), run_time=0.6)
+        self.beat("Three roads look shorter than four.", gold)
+        self.beat("Yet those three roads cost 450 kilometres.")
 
-    def astar(self):
-        for y,text,color in [(1.5,'Already paid: 220 km',PURPLE),
-                             (0,'Estimated remainder: 198 km',GOLD),
-                             (-1.5,'Whole-trip estimate: 418 km',GREEN)]:
-            self.play(FadeIn(label(text,25,color,width=6.1).move_to(LEFT*3.7+UP*y)),run_time=.6)
-            self.wait(1.5)
-        self.say('Rank each city by its estimated whole journey.')
-        self.say('This is A*.', GREEN)
-        self.equation('astar')
-        self.say('But which estimates are safe?')
+        def purple():
+            t2 = self.counter("", PURPLE, RIGHT * 3.4 + UP * 0.2, unit=" km")
+            tot = 0
+            for a, b in zip(r2, r2[1:]):
+                tot += km(a, b)
+                key = frozenset((a, b))
+                p, q = box['d'].points_by_city[a], box['d'].points_by_city[b]
+                if key in drawn:
+                    self.remove(drawn[key])
+                    mob = split_line(p, q, GOLD, PURPLE).set_z_index(2)
+                    self.add(mob)
+                    self.play(Indicate(mob), t2.animate.set_value(tot), run_time=0.5)
+                else:
+                    mob = Line(p, q, color=PURPLE, stroke_width=7).set_z_index(2)
+                    self.play(Create(mob), t2.animate.set_value(tot), run_time=0.6)
+                drawn[key] = mob
+            self.add(self.token([box['d'].points_by_city[c] for c in r2], GREEN, speed=1.5))
+        self.beat("The four-road route costs just 418.", purple)
+        self.beat("We want less distance, not fewer roads.")
 
-    def optimism(self):
-        base = LEFT*6.8
-        for y,value,color in [(1.4,198,GREEN),(0,160,GOLD),(-1.4,230,RED)]:
-            bar = Rectangle(width=value/45,height=.2,fill_color=color,fill_opacity=1,stroke_width=0)
-            bar.move_to(base+RIGHT*bar.width/2+UP*y)
-            self.play(GrowFromEdge(bar,LEFT),
-                      FadeIn(label(f'{value} km',22,color).next_to(bar,UP,buff=.15)),run_time=.7)
-        self.say('True remainder: 198 km.\n160 is optimistic; 230 is too high.')
-        self.panel(VGroup(label('h(n,t)',30,GOLD),label(' ≤ ',30,INK),
-                          label('d(n,t)',30,GREEN)).arrange(RIGHT,buff=.08))
-        self.say('Never overestimate.\nThis is admissibility.')
-        self.say('Reopen a city if a cheaper route to it is found.')
-        self.say('How can we build such an estimate?')
+    def sc_explore(self):
+        self.title('Explore by cost')
+        d = self.diagram()
+        ucs = DATA['demo']['algos']['ucs']['steps']
+        costs = {'Arad': 0}
+        st = {'n': 0}
+        explored = self.counter('explored', PURPLE, RIGHT * 3.4 + UP * 1.5)
+        gcost = self.counter('cost so far', GOLD, RIGHT * 3.4 + UP * 0.5, unit=" km")
 
-    def make_vectors(self):
-        point = LEFT*6.5+DOWN*1.2
-        origin = point.copy()
-        arrows = VGroup()
-        for vector,color in zip([RIGHT*1.45+UP*1.2,RIGHT*1.65+DOWN*.4,RIGHT*1.3+UP*1.3],
-                                [CYAN,GOLD,PURPLE]):
-            arrow = Arrow(point,point+vector,buff=0,color=color,stroke_width=6)
-            arrows.add(arrow)
-            self.play(GrowArrow(arrow),run_time=.7)
-            point += vector
-        direct = Arrow(origin,point,buff=0,color=GREEN,stroke_width=3)
-        self.play(GrowArrow(direct),run_time=.7)
-        arrows.add(direct)
-        self.add(arrows)
-        self.vector_diagram = arrows
+        def expand():
+            for step in ucs:
+                cur = step['current']
+                self.play(Indicate(d.nodes[cur], color=PURPLE, scale_factor=1.3), run_time=0.25)
+                gcost.set_value(costs[cur])
+                if cur != 'Bucharest':      # stop at the goal: no stray edges past it
+                    for e in DATA['graph'][cur]['edges']:
+                        nb = e['to']
+                        c = costs[cur] + e['km']
+                        if c < costs.get(nb, 1e9):
+                            costs[nb] = c
+                            self.add(Line(d.points_by_city[cur], d.points_by_city[nb], color=PURPLE, stroke_width=4).set_z_index(1))
+                st['n'] += 1
+                explored.set_value(st['n'])
+                self.wait(0.15)
+        self.beat("At Arad, no travel cost has accumulated.")
+        self.beat("Extend the lowest-cost route so far.", expand)
+        self.beat("This rule defines uniform cost search.",
+                  lambda: self.play(FadeIn(label('priority = g', 24, PURPLE).move_to(RIGHT * 3.4 + DOWN * 0.7)), run_time=0.4))
+        self.beat("The first goal it settles is optimal.",
+                  lambda: self.play(FadeIn(label('optimal   complete', 24, GREEN).move_to(RIGHT * 3.4 + DOWN * 1.5)), run_time=0.4))
 
-    def lp(self):
-        self.make_vectors()
-        self.say('A route adds road displacements.')
-        self.say('What if we could buy fractions of roads, even disconnected ones?')
-        self.say('Keep the same total displacement.\nMinimize the cost.')
-        self.say('This is a linear program: LP.')
-        self.panel(VGroup(label('min Σ αᵢ cᵢ',28,GOLD),
-                          label('Σ αᵢ vᵢ = Δ',28,CYAN),
-                          label('0 ≤ αᵢ ≤ 1',24,INK)).arrange(DOWN,buff=.3))
-        self.say('Why should this easier problem help?', GREEN)
+        def waste():
+            for rt in (['Arad', 'Timisoara', 'Lugoj'], ['Arad', 'Zerind', 'Oradea']):
+                for a, b in zip(rt, rt[1:]):
+                    self.play(Create(Line(d.points_by_city[a], d.points_by_city[b], color=PURPLE, stroke_width=4).set_z_index(1)), run_time=0.35)
+        self.beat("Without a guide, it spreads in all directions.", waste)
 
-    def lpproof(self):
-        if self.vector_diagram not in self.mobjects:
-            self.make_vectors()
-        self.say('Keep the same arrows.\nA real route is one allowed mixture.')
-        self.say('Choose each path edge once.\nIntermediate positions cancel.')
-        self.say('Extra choices can only lower the minimum.')
-        self.say(f'LP: {example()["lp"]:.2f} km\nTrue shortest route: 418 km', GREEN)
-        self.say('The project solves these bounds offline and checks the table.')
+    def sc_ucsproof(self):
+        self.title('Why cheapest-first works')
+        pts = [LEFT * 6.0 + UP * 0.4, LEFT * 1.6 + UP * 0.4, RIGHT * 3.0 + UP * 0.4]
+        for p, t in zip(pts, ['start', 'frontier', 'goal']):
+            self.add(Dot(p, color=PURPLE), label(t, 20, MUTED).next_to(p, DOWN, buff=0.25))
+        self.beat("Why does choosing by cost work?",
+                  lambda: self.play(Create(Line(pts[0], pts[1], color=PURPLE, stroke_width=5)), run_time=0.5))
+        self.beat("Suppose it chooses a goal too soon.",
+                  lambda: (self.play(Create(Line(pts[0], pts[2], color=GREEN, stroke_width=5)), run_time=0.5),
+                           self.add(self.token([pts[0], pts[2]], INK)),
+                           self.add(tag('picked first', 18, GREEN).move_to((pts[0] + pts[2]) / 2 + UP * 0.45))))
+        self.beat("A cheaper route must remain unfinished.",
+                  lambda: (self.play(Create(DashedLine(pts[1], pts[2], color=GOLD)), run_time=0.5),
+                           self.add(self.token([pts[0], pts[1], pts[2]], GOLD)),
+                           self.add(tag('still hidden', 18, GOLD).move_to((pts[1] + pts[2]) / 2 + DOWN * 0.5))))
+        self.beat("Its frontier city has a lower cost.",
+                  lambda: self.play(Indicate(Dot(pts[1], color=GOLD), color=GOLD), run_time=0.6))
+        self.beat("That city must come first, a contradiction.",
+                  lambda: self.add(label('chosen first  →  contradiction', 22, RED).move_to(DOWN * 1.3)))
 
-    def landmark(self):
-        diagram = self.map()
-        self.play(Indicate(diagram.nodes['Giurgiu'],color=GOLD),run_time=.7)
-        self.say('Choose a landmark: Giurgiu.',GOLD)
-        self.draw_route(diagram,['Giurgiu','Bucharest','Pitesti','Rimnicu Vilcea','Sibiu','Arad'],CYAN)
-        self.say('Giurgiu to Arad: 508 km',CYAN)
-        self.draw_route(diagram,['Giurgiu','Bucharest'],GOLD)
-        self.say('Giurgiu to Bucharest: 90 km',GOLD)
-        self.say('508 − 90 = 418 km',GREEN)
-        self.say('Why does subtracting these distances give a lower bound?')
+    def sc_estimate(self):
+        self.title('Guide with an estimate')
+        d = self.diagram(width=7.2)
+        lbls = []
 
-    def triangle(self):
-        points = [LEFT*6.5+DOWN,LEFT*1.5+DOWN,LEFT*4+UP*1.5]
-        for p,name in zip(points,['n','t','L']):
-            self.add(Dot(p,color=MUTED),label(name,25).next_to(p,UP,buff=.15))
-        for a,b,color in [(0,2,CYAN),(1,2,GOLD),(0,1,GREEN)]:
-            self.play(Create(Line(points[a],points[b],color=color,stroke_width=5)),run_time=.6)
-        self.say('Going through t cannot beat the shortest route from L to n.')
-        self.panel(VGroup(
-            label('d(L,n)',28,CYAN), label(' ≤ ',28,INK),
-            label('d(L,t)',28,GOLD), label(' + ',28,INK),
-            label('d(t,n)',28,GREEN),
-        ).arrange(RIGHT,buff=.08), hold=3)
-        self.say('Swap n and t.\nRearrange both inequalities.')
-        self.equation('triangle')
-        self.say('Try several landmarks.\nKeep the largest lower bound.')
-        self.say('This is the landmark idea behind ALT.',GOLD)
+        def b1():
+            ga = DoubleArrow(d.nodes['Arad'], d.nodes['Rimnicu Vilcea'], buff=0.16,
+                             color=PURPLE, stroke_width=6).set_z_index(4)
+            self.play(Indicate(d.nodes['Arad'], color=PURPLE),
+                      Indicate(d.nodes['Rimnicu Vilcea'], color=PURPLE),
+                      Create(ga), run_time=0.7)
+            l = tag('g = 220', 20, PURPLE).move_to(RIGHT * 1.4 + UP * 1.35)
+            lbls.extend([ga, l])
+            self.add(l)
+        self.beat("Reaching Rimnicu Vilcea has cost 220.", b1)
 
-    def combine(self):
-        for y,text,color in [(1,'LP: 388.21 km',PURPLE),(-.4,'ALT: 418 km',GOLD)]:
-            self.play(FadeIn(label(text,29,color).move_to(LEFT*3.8+UP*y)),run_time=.6)
-        self.say('Both estimate the same remaining journey.')
-        self.say('Keep the larger safe estimate.\nDo not add them.')
-        self.equation('combine')
-        self.say('A* has guidance.\nCould we also start at the other end?')
+        def b2():
+            ha = DoubleArrow(d.nodes['Rimnicu Vilcea'], d.nodes['Bucharest'], buff=0.16,
+                             color=GOLD, stroke_width=6).set_z_index(4)
+            self.play(Indicate(d.nodes['Rimnicu Vilcea'], color=GOLD),
+                      Indicate(d.nodes['Bucharest'], color=GOLD),
+                      Create(ha), run_time=0.7)
+            l = tag('h = 198', 20, GOLD).move_to(RIGHT * 1.4 + UP * 0.55)
+            lbls.extend([ha, l])
+            self.add(l)
+        self.beat("Estimate the rest: about 198.", b2)
 
-    def ensemble(self):
-        # Same graph as the combine step, but the max is now justified on one
-        # concrete pair where the LP is the deciding (larger) term.
-        pair = next(p for p in DATA['variants']['lm8']['pairs'] if p['s'] == 'Arad' and p['t'] == 'Craiova')
-        d, lp, alt = pair['optimal'], pair['lp'], pair['alt']
-        x0, y0, span = -6.5, 1.5, 6.0
-        scale = span / d
-        ceiling = Line([x0, y0, 0], [x0+span, y0, 0], color=INK, stroke_width=5)
-        self.play(Create(ceiling), FadeIn(
-            label(f'true distance d = {d:.0f} km', 20, INK).next_to(ceiling, UP, buff=.15).align_to(ceiling, LEFT)), run_time=.7)
-        self.say('The ceiling is the true remaining distance.')
-        for i, (name, value, color) in enumerate([('hLP', lp, PURPLE), ('hALT', alt, GOLD)]):
-            y = y0 - .95 - i*.95
-            bar = Rectangle(width=value*scale, height=.34, fill_color=color, fill_opacity=1, stroke_width=0)
-            bar.move_to([x0+bar.width/2, y, 0])
-            self.play(GrowFromEdge(bar, LEFT),
-                      FadeIn(label(f'{name} = {value:.0f}', 19, color).next_to(bar, UP, buff=.08).align_to(bar, LEFT)), run_time=.6)
-        self.say('Both estimates sit below the ceiling.')
-        value = max(lp, alt)
-        y = y0 - .95 - 2*.95
-        bar = Rectangle(width=value*scale, height=.34, fill_color=GREEN, fill_opacity=1, stroke_width=0)
-        bar.move_to([x0+bar.width/2, y, 0])
-        self.play(GrowFromEdge(bar, LEFT),
-                  FadeIn(label(f'max = {value:.0f}', 19, GREEN).next_to(bar, UP, buff=.08).align_to(bar, LEFT)), run_time=.6)
-        self.say('The maximum is the taller estimate,\nstill below the ceiling.', GREEN)
-        self.say('And it is never smaller than either.')
-        self.say('Safe and never weaker: keep the maximum.')
+        def b3():
+            self.play(*[FadeOut(m) for m in [d, *lbls]], run_time=0.4)
+            self.bar(220, 1.5, PURPLE, 'g  already paid   220', 6.0 / 450)
+            self.bar(198, 0.5, GOLD, 'h  estimated left   198', 6.0 / 450)
+        self.beat("Combine cost so far with cost still to come.", b3)
+        self.beat("A* ranks routes by their sum: f = g + h.",
+                  lambda: self.bar(418, -0.6, GREEN, 'f = g + h   418', 6.0 / 450))
 
-    def admissible(self):
-        # Empirical admissibility: every ordered pair plotted against the
-        # ceiling h = d. The diagonal may be touched, never crossed.
-        pairs = DATA['variants']['lm8']['pairs']
-        ax = Axes(x_range=[0, 1000, 200], y_range=[0, 1000, 200], x_length=5.0, y_length=4.1,
-                  tips=False, axis_config={'color': MUTED, 'stroke_width': 2, 'font_size': 16})
-        ax.move_to(LEFT*3.4+DOWN*.2)
-        self.play(FadeIn(ax), run_time=.6)
-        self.add(label('true distance d', 18, MUTED).next_to(ax.x_axis, DOWN, buff=.28))
-        self.add(label('estimate h', 18, MUTED).rotate(PI/2).next_to(ax.y_axis, LEFT, buff=.22))
-        ceiling = DashedLine(ax.c2p(0, 0), ax.c2p(1000, 1000), color=GREEN, stroke_width=4)
-        self.play(Create(ceiling), run_time=.7)
-        self.say('The diagonal is the ceiling h = d.')
-        for key, color, text in [('lp', PURPLE, 'LP alone: all 380 below the line.'),
-                                 ('alt', GOLD, 'Landmarks alone: below as well.'),
-                                 ('h', GREEN, 'Their maximum: none above the line,\non all 380 pairs.')]:
-            dots = VGroup(*[Dot(ax.c2p(p['optimal'], p[key]), radius=.033, color=color) for p in pairs])
-            self.play(FadeIn(dots), run_time=.7)
-            self.say(text, color)
-        self.say('Admissibility here is measured,\nnot assumed.', GREEN)
+    def sc_twoways(self):
+        self.title('Two ways to estimate the rest')
 
-    def tightness(self):
-        m = DATA['variants']['lm8']
-        x0, y0, span = -6.4, 1.6, 6.2
-        ceiling = Line([x0, y0, 0], [x0+span, y0, 0], color=INK, stroke_width=4)
-        self.play(Create(ceiling), FadeIn(
-            label('true distance = 1.0', 19, INK).next_to(ceiling, UP, buff=.12).align_to(ceiling, LEFT)), run_time=.6)
-        for i, (name, value, color) in enumerate([('LP alone', m['meanLP'], PURPLE),
-                                                  ('Landmarks (lm8)', m['meanALT'], GOLD),
-                                                  ('Ensemble max', m['meanCombined'], GREEN)]):
-            y = y0 - .9 - i*.9
-            bar = Rectangle(width=value*span, height=.36, fill_color=color, fill_opacity=1, stroke_width=0)
-            bar.move_to([x0+bar.width/2, y, 0])
-            self.play(GrowFromEdge(bar, LEFT),
-                      FadeIn(label(f'{name}: {value:.3f}', 19, color).next_to(bar, UP, buff=.08).align_to(bar, LEFT)), run_time=.6)
-        self.say('Higher is tighter, and the max is\nnever below either.')
-        self.say('On 4 of 380 pairs the LP is the deciding term.')
-        pair = next(p for p in m['pairs'] if p['s'] == 'Craiova' and p['t'] == 'Zerind')
-        self.panel(VGroup(
-            label('Craiova → Zerind', 22, INK),
-            label(f'LP {pair["lp"]:.0f}  >  ALT {pair["alt"]:.0f}', 22, GOLD),
-            label(f'max = {pair["h"]:.0f}  ≤  d = {pair["optimal"]:.0f}', 22, GREEN),
-        ).arrange(DOWN, aligned_edge=LEFT, buff=.18))
-        self.say('Two independent methods;\nsafety never rests on one.')
+        def b1():
+            self.add(label('LP  (vectors)', 24, CYAN).move_to(LEFT * 4.0 + UP * 2.6))
+            p = LEFT * 6.4 + DOWN * 0.3
+            for vec, c in [(RIGHT * 1.5 + UP * 1.1, PURPLE), (RIGHT * 1.7, GOLD), (RIGHT * 0.9 + DOWN * 0.9, GREEN)]:
+                self.play(GrowArrow(Arrow(p, p + vec, buff=0, color=c, stroke_width=6)), run_time=0.35)
+                p += vec
+            self.play(GrowArrow(Arrow(LEFT * 6.4 + DOWN * 0.3, p, buff=0, color=CYAN, stroke_width=3)), run_time=0.4)
+        self.beat("Allow fractional amounts of road vectors.", b1)
+        self.beat("The cheapest combination costs 388.",
+                  lambda: self.add(label('min  Σ α·cost  →  388', 20, CYAN).move_to(LEFT * 4.0 + DOWN * 1.7)))
 
-    def landmarks(self):
-        y0, scale = -1.9, 3.8
-        centers = [-5.2, -3.0, -0.8]
-        ceiling = DashedLine([-6.4, y0+scale, 0], [-.1, y0+scale, 0], color=INK, stroke_width=3)
-        self.play(Create(ceiling), FadeIn(
-            label('true distance = 1.0', 18, MUTED).next_to(ceiling, UP, buff=.12).align_to(ceiling, LEFT)), run_time=.6)
-        for preset, cx in zip(['lm2', 'lm4', 'lm8'], centers):
-            m = DATA['variants'][preset]
-            for dx, value, color in [(-.34, m['meanALT'], GOLD), (.34, m['meanCombined'], GREEN)]:
-                bar = Rectangle(width=.52, height=value*scale, fill_color=color, fill_opacity=1, stroke_width=0)
-                bar.move_to([cx+dx, y0+value*scale/2, 0])
-                self.play(GrowFromEdge(bar, DOWN), run_time=.45)
-            self.add(label(preset, 20, INK).move_to([cx, y0-.4, 0]))
-        self.say('Gold: landmarks alone.  Green: the ensemble.', MUTED, 24)
-        self.say('Two landmarks reach 0.90 of the distance;\nfour reach 0.97; eight reach 0.98.')
-        self.say('More landmarks never loosen the bound,\nand never break safety.', GREEN)
+        def b3():
+            self.add(label('ALT  (landmark)', 24, GOLD).move_to(RIGHT * 3.6 + UP * 2.6))
+            for yy, t in [(1.2, 'd(Giurgiu, Bucharest) = 90'), (0.4, 'd(Giurgiu, Arad) = 508')]:
+                self.play(FadeIn(label(t, 20, GOLD).move_to(RIGHT * 3.6 + UP * yy)), run_time=0.35)
+        self.beat("Alternatively, use distances from a landmark.", b3)
+        self.beat("Their difference gives a bound of 418.",
+                  lambda: self.play(FadeIn(label('difference = 418', 22, GOLD).move_to(RIGHT * 3.6 + DOWN * 0.6)), run_time=0.4))
 
-    def exact(self):
-        rows = [('Arad', 508, 418), ('Fagaras', 301, 211), ('Pitesti', 191, 101),
-                ('Craiova', 329, 239), ('Eforie', 359, 269)]
-        cols = [-6.6, -4.7, -3.0, -1.4]
-        header = VGroup(label('city', 18, MUTED), label('d(Giurgiu, c)', 18, MUTED),
-                        label('− 90', 18, MUTED), label('= d(Bucharest, c)', 18, GREEN))
-        for item, x in zip(header, cols):
-            item.move_to([x, 1.7, 0])
-        self.play(FadeIn(header), run_time=.5)
-        self.play(Create(Line([-6.9, 1.4, 0], [-.1, 1.4, 0], color=MUTED, stroke_width=1.5)), run_time=.4)
-        for i, (city, dg, db) in enumerate(rows):
-            y = 1.0 - i*.62
-            self.play(FadeIn(label(city, 19, INK).move_to([-6.6, y, 0])),
-                      FadeIn(label(f'{dg}', 19, CYAN).move_to([-4.7, y, 0])),
-                      FadeIn(label('− 90', 19, MUTED).move_to([-3.0, y, 0])),
-                      FadeIn(label(f'= {db}', 19, GREEN).move_to([-1.4, y, 0])), run_time=.35)
-        self.say('Giurgiu is degree one,\nso its difference is exact.')
-        self.say('On 360 of 380 pairs the estimate is exact.', GREEN)
-        self.say("Exact where the landmark allows it;\nsafe everywhere else.")
+    def sc_lpproof(self):
+        self.title('Why the LP is a lower bound')
+        width, center = 7.6, RIGHT * 1.5 + UP * 0.35
+        cities = ['Arad', 'Sibiu', 'Rimnicu Vilcea', 'Pitesti', 'Bucharest']
+        pt = {c: np.array([(DATA['graph'][c]['x'] - 2043) / 2540 * width,
+                           -(DATA['graph'][c]['y'] - 1254) / 2540 * width, 0]) + center
+              for c in cities}
+        a, b = pt['Arad'], pt['Bucharest']
+        dhat = (b - a) / np.linalg.norm(b - a)
+        normal = np.array([-dhat[1], dhat[0], 0])
+        if normal[1] < 0:
+            normal = -normal
+        pairs = list(zip(cities, cities[1:]))
+        kms = [km(u, v) for u, v in pairs]
+        colors = [CYAN, GOLD, PURPLE, GREEN]
+        tr = ValueTracker(0.0)
 
-    def consistency(self):
-        a, b = LEFT*6.2+UP*.8, LEFT*3.4+UP*.8
-        self.play(FadeIn(Dot(a, color=MUTED)), FadeIn(Dot(b, color=MUTED)), run_time=.4)
-        self.add(label('Arad', 22, INK).next_to(a, UP, buff=.15),
-                 label('Sibiu', 22, INK).next_to(b, UP, buff=.15))
-        self.play(Create(Line(a, b, color='#53627A', stroke_width=4)),
-                  FadeIn(label('140', 20, MUTED).move_to((a+b)/2+UP*.28)), run_time=.6)
-        self.play(FadeIn(label('h(Arad) = 418', 22, GOLD).next_to(a, DOWN, buff=.35)),
-                  FadeIn(label('h(Sibiu) = 278', 22, GOLD).next_to(b, DOWN, buff=.35)), run_time=.5)
-        self.say('Along one road the estimate may rise.')
-        self.say('But only by that road\'s cost:\n418 ≤ 140 + 278.', GREEN)
-        self.panel(VGroup(label("h(n) ≤ c + h(n')", 26, INK)))
-        self.say('Checked on every road and goal:\nzero violations.')
-        self.say('The search still reopens improved states.', CYAN)
-        self.say('Optimality rests on admissibility.\nStability is a measured bonus.')
+        def endpoints(u, p):
+            proj = np.dot(pt[p] - a, dhat) * dhat
+            return a + (pt[p] - a) * (1 - u) + proj * u
 
-    def guided(self):
-        # Replay the real A*(LP+ALT) trace so the payoff is shown, not claimed.
-        diagram = self.map()
-        trace = DATA['demo']['algos']['astarAlt']
-        costs, tree = {'Arad': 0}, {}
-        for step in trace['steps'][:-1]:
-            current = step['current']
-            self.play(Indicate(diagram.nodes[current], color=CYAN, scale_factor=1.3), run_time=.22)
-            for edge in DATA['graph'][current]['edges']:
-                neighbor = edge['to']
-                cost = costs[current] + edge['km']
-                if cost < costs.get(neighbor, float('inf')):
-                    costs[neighbor] = cost
-                    line = Line(diagram.points_by_city[current], diagram.points_by_city[neighbor],
-                                color=CYAN, stroke_width=4).set_z_index(1)
-                    changes = [Create(line), diagram.nodes[neighbor].animate.set_color(GREEN)]
-                    if neighbor in tree:
-                        changes.append(FadeOut(tree[neighbor]))
-                    self.play(*changes, run_time=.3)
-                    tree[neighbor] = line
-            self.play(diagram.nodes[current].animate.set_color(CYAN), run_time=.12)
-        self.draw_route(diagram, trace['path'])
-        self.say('A* with the combined estimate settles 5 cities.', GREEN)
-        self.say('Uniform cost settled 13 on the same query.')
-        self.say('The route is identical, and still 418 km.')
+        def chain_at(u):
+            return VGroup(*[Arrow(endpoints(u, p), endpoints(u, q), buff=0, color=col,
+                                  stroke_width=5).set_z_index(3)
+                            for (p, q), col in zip(pairs, colors)])
 
-    def breadth(self):
-        w = DATA['work']['lm8']['expansions']
-        rows = [('UCS (uninformed)', w['ucs'], PURPLE),
-                ('Greedy best-first', w['greedy'], RED),
-                ('A* (LP only)', w['astar'], GOLD),
-                ('A* (ALT only)', w['astarAltOnly'], CYAN),
-                ('A* (LP+ALT)', w['astarAlt'], GREEN),
-                ('Bidirectional A*', w['biastar'], MUTED)]
-        x0, scale = -4.3, 3.6/11.0
-        for i, (name, value, color) in enumerate(rows):
-            y = 1.7 - i*.72
-            self.add(label(name, 19, color).next_to(np.array([x0, y, 0]), LEFT, buff=.2))
-            bar = Rectangle(width=value*scale, height=.32, fill_color=color, fill_opacity=1, stroke_width=0)
-            bar.move_to([x0+bar.width/2, y, 0])
-            self.play(GrowFromEdge(bar, LEFT),
-                      FadeIn(label(f'{value:.1f}', 18, color).next_to(bar, RIGHT, buff=.15)), run_time=.4)
-        self.say('Guided search expands about half\nof uniform cost search.')
-        self.say(f'Greedy is fewest, but wrong on\n{DATA["work"]["lm8"]["greedySuboptimal"]} of 380 pairs.', RED)
-        self.say('Every A* variant here stays optimal.', GREEN)
+        def labels_at(u):
+            return VGroup(*[label(str(k), 20, col).set_z_index(6).move_to(
+                (endpoints(u, p) + endpoints(u, q)) / 2 + normal * 0.34)
+                for (p, q), k, col in zip(pairs, kms, colors)])
 
-    def coverage(self):
-        # For one goal, show both component bounds city by city; the taller bar
-        # is exactly the maximum the search uses.
-        pairs = {p['s']: p for p in DATA['variants']['lm8']['pairs'] if p['t'] == 'Bucharest'}
-        cities = ['Arad', 'Sibiu', 'Fagaras', 'Pitesti', 'Craiova', 'Eforie']
-        y0, scale = -1.9, 3.7
-        centers = np.linspace(-5.6, -1.0, len(cities))
-        ceiling = DashedLine([-6.4, y0+scale, 0], [.1, y0+scale, 0], color=INK, stroke_width=3)
-        self.play(Create(ceiling), FadeIn(
-            label('true distance = 1.0', 18, MUTED).next_to(ceiling, UP, buff=.12).align_to(ceiling, LEFT)), run_time=.6)
-        for city, cx in zip(cities, centers):
-            p = pairs[city]
-            for dx, value, color in [(-.19, p['lp']/p['optimal'], PURPLE), (.19, p['alt']/p['optimal'], GOLD)]:
-                bar = Rectangle(width=.34, height=value*scale, fill_color=color, fill_opacity=1, stroke_width=0)
-                bar.move_to([cx+dx, y0+value*scale/2, 0])
-                self.play(GrowFromEdge(bar, DOWN), run_time=.35)
-            self.add(label(city, 16, INK).move_to([cx, y0-.42, 0]))
-        self.say('Goal: Bucharest.  Purple: LP.  Gold: landmarks.', MUTED, 23)
-        self.say('The maximum keeps the taller bar for each city.')
-        self.say('ALT usually wins; LP still decides some pairs.', GOLD)
+        chain = chain_at(0)
+        kml = labels_at(0)
+        for m in (chain, kml):
+            m.add_updater(lambda mm, f=(chain_at if m is chain else labels_at): mm.become(f(tr.get_value())))
 
-    def saving(self):
-        pairs = DATA['variants']['lm8']['pairs']
-        M = max(max(p['exp']['ucs'], p['exp']['astarAlt']) for p in pairs) + 1
-        ax = Axes(x_range=[0, M, 3], y_range=[0, M, 3], x_length=4.6, y_length=4.6, tips=False,
-                  axis_config={'color': MUTED, 'stroke_width': 2, 'font_size': 15}).move_to(LEFT*3.4+DOWN*.2)
-        self.play(FadeIn(ax), run_time=.5)
-        self.add(label('UCS expansions', 17, MUTED).next_to(ax.x_axis, DOWN, buff=.25),
-                 label('A* expansions', 17, MUTED).rotate(PI/2).next_to(ax.y_axis, LEFT, buff=.2))
-        self.play(Create(DashedLine(ax.c2p(0, 0), ax.c2p(M, M), color=INK, stroke_width=2)), run_time=.5)
-        self.say('The diagonal means equal work.')
-        dots = VGroup()
-        for i, p in enumerate(pairs):
-            x, y = p['exp']['ucs'], p['exp']['astarAlt']
-            jx, jy = ((i*37) % 7-3)/3*.14, ((i*53) % 7-3)/3*.14
-            color = GREEN if y < x else (MUTED if y == x else RED)
-            dots.add(Dot(ax.c2p(x+jx, y+jy), radius=.045, color=color))
-        self.play(FadeIn(dots), run_time=.8)
-        self.say('Almost every pair lies below the diagonal.', GREEN)
-        self.say('A* settles fewer cities on 352 of 380,\nand never more.', GREEN)
+        def draw():
+            self.add(VGroup(*[Dot(pt[c], radius=0.075, color=INK).set_z_index(5) for c in cities]))
+            self.add(label('a', 20, INK).move_to(pt['Arad'] + normal * 0.34),
+                     label('b', 20, INK).move_to(pt['Bucharest'] + normal * 0.34),
+                     label('Arad', 17, MUTED).move_to(pt['Arad'] - normal * 0.36),
+                     label('Bucharest', 17, MUTED).move_to(pt['Bucharest'] - normal * 0.36))
+            self.bdot = Dot(b, color=GREEN, radius=0.1).set_z_index(7)
+            self.add(chain, kml)
+        self.beat("Place the route's road arrows head to tail.", draw)
+        self.beat("Together, they reach Bucharest exactly.",
+                  lambda: self.play(Indicate(self.bdot, color=GREEN, scale_factor=2.0), run_time=0.6))
 
-    def optimality(self):
-        w = DATA['work']['lm8']['optimalCount']
-        rows = [('Uniform cost (UCS)', 'ucs', PURPLE),
-                ('A* (LP only)', 'astar', GOLD),
-                ('A* (ALT only)', 'astarAltOnly', CYAN),
-                ('A* (LP+ALT)', 'astarAlt', GREEN),
-                ('Bidirectional A*', 'biastar', MUTED),
-                ('Greedy best-first', 'greedy', RED)]
-        self.play(FadeIn(label('optimal routes / 380 pairs', 20, MUTED).move_to([-3.6, 2.0, 0])), run_time=.4)
-        self.play(Create(Line([-7.0, 1.7, 0], [-.2, 1.7, 0], color=MUTED, stroke_width=1.5)), run_time=.3)
-        for i, (name, key, color) in enumerate(rows):
-            y = 1.1 - i*.62
-            n = w[key]
-            self.play(FadeIn(label(name, 19, color).move_to([-5.2, y, 0])),
-                      FadeIn(label(f'{n} / 380', 19, GREEN if n == 380 else RED).move_to([-1.2, y, 0])), run_time=.4)
-        self.say('Every heuristic search is optimal\non all 380 pairs.', GREEN)
-        self.say('Greedy alone falls short: 319 of 380.', RED)
-        self.say('Guidance keeps the answer exact.')
+        chord = DashedLine(a, b, color=GOLD, stroke_width=3).set_z_index(2)
+        self.beat("Their vector sum spans the start-to-goal gap.",
+                  lambda: (self.play(Create(chord), run_time=0.6),
+                           self.add(label('the gap', 20, GOLD).move_to((a + b) / 2 + normal * 0.95))))
 
-    def guarantee(self):
-        x0, span = -6.6, 6.2
-        scale = span/450
-        for name, value, color, y in [('optimal cost C*  = 418', 418, INK, 1.2),
-                                       ('frontier f(n)  ≤  418', 418, GREEN, .1),
-                                       ('selected goal g  =  450', 450, PURPLE, -1.0)]:
-            bar = Rectangle(width=value*scale, height=.36, fill_color=color, fill_opacity=1, stroke_width=0)
-            bar.move_to([x0+bar.width/2, y, 0])
-            self.play(GrowFromEdge(bar, LEFT),
-                      FadeIn(label(name, 19, color).next_to(bar, UP, buff=.06).align_to(bar, LEFT)), run_time=.6)
-        self.say('Suppose a cheaper route C* still exists.')
-        self.say('A frontier city has value no larger than C*,\nso it is expanded before the goal.', GREEN)
-        self.say('That contradicts the goal being chosen.', RED)
-        self.say('So an admissible estimate preserves optimality.', GREEN)
+        read = label('real route   140+80+97+101 = 418', 20, INK).set_z_index(6).move_to(DOWN * 2.45)
+        self.add(read)
+        self.beat("Now allow fractional amounts of each arrow.",
+                  lambda: self.play(tr.animate.set_value(0.55), run_time=1.0, rate_func=smooth))
+        self.beat("The minimum falls from 418 to 388.",
+                  lambda: self.play(tr.animate.set_value(1.0),
+                                    Transform(read, label('cheapest mixture  =  388', 20, PURPLE).set_z_index(6).move_to(DOWN * 2.45)),
+                                    run_time=1.6, rate_func=smooth))
+        chain.clear_updaters()
+        kml.clear_updaters()
+        self.beat("This minimum cannot exceed a real route's cost.",
+                  lambda: self.play(FadeIn(label('never overshoots the goal', 24, GREEN).move_to(RIGHT * 4.6 + UP * 2.0)), run_time=0.4))
 
-    def bidirectional(self):
-        diagram = self.map()
-        self.say('Start at Arad…',CYAN)
-        self.play(Indicate(diagram.nodes['Arad'],color=CYAN),run_time=.6)
-        self.say('…and at Bucharest.',GOLD)
-        self.play(Indicate(diagram.nodes['Bucharest'],color=GOLD),run_time=.6)
-        # The exported implementation alternates directions; omit its final
-        # synthetic display frame. Relax edges with separate costs/parents.
-        costs = [{'Arad':0},{'Bucharest':0}]
-        trees = [{},{}]
-        for i,step in enumerate(example()['biastar']['steps'][:-1]):
-            side = i % 2
-            color = [CYAN,GOLD][side]
-            current = step['current']
-            self.play(Indicate(diagram.nodes[current],color=color),run_time=.3)
-            for edge in DATA['graph'][current]['edges']:
-                neighbor = edge['to']
-                candidate = costs[side][current]+edge['km']
-                if candidate < costs[side].get(neighbor,float('inf')):
-                    costs[side][neighbor] = candidate
-                    line = Line(diagram.points_by_city[current],diagram.points_by_city[neighbor],
-                                color=color,stroke_width=4).set_z_index(1)
-                    animations = [Create(line)]
-                    if neighbor in trees[side]:
-                        animations.append(FadeOut(trees[side][neighbor]))
-                    self.play(*animations,run_time=.25)
-                    trees[side][neighbor] = line
-        self.say('Each side uses its own A* estimate.\nThis is bidirectional A*.')
-        self.say('The searches share a city.\nAre we done?')
+    def sc_triangle(self):
+        self.title('Why subtract landmark distances')
+        L = LEFT * 5.4 + UP * 1.3
+        n = LEFT * 6.2 + DOWN * 1.2
+        t = RIGHT * 0.8 + DOWN * 1.2
+        for p, name, d in [(L, 'L', UP), (n, 'n', DOWN), (t, 't', UP)]:
+            self.add(Dot(p, color=MUTED), label(name, 24).next_to(p, d, buff=0.15))
+        self.beat("Why use the difference in distances?",
+                  lambda: (self.play(Create(Line(L, t, color=GREEN, stroke_width=5)), run_time=0.5),
+                           self.add(self.token([L, t], GOLD)),
+                           self.add(tag('d(L,t)', 20, GREEN).move_to((L + t) / 2 + UP * 0.35))))
+        self.beat("Going via t cannot shorten the shortest path.",
+                  lambda: (self.play(Create(Line(L, n, color=CYAN, stroke_width=5)), run_time=0.5),
+                           self.add(tag('d(L,n)', 20, CYAN).move_to((L + n) / 2 + LEFT * 0.7))))
+        self.beat("Thus d(L,n) ≤ d(L,t) + d(t,n).",
+                  lambda: (self.play(Create(Line(n, t, color=RED, stroke_width=5)), run_time=0.5),
+                           self.add(self.token([L, n, t], GOLD)),
+                           self.add(tag('d(n,t)', 20, RED).move_to((n + t) / 2 + UP * 0.30))))
+        self.beat("Swap n and t, then rearrange both inequalities.", lambda: self.add(
+            VGroup(label('|', 28, INK), label('d(L,n)', 28, CYAN), label('  −  ', 28, INK),
+                   label('d(L,t)', 28, GREEN), label('|   ≤   ', 28, INK),
+                   label('d(n,t)', 28, RED)).arrange(RIGHT, buff=0.06).move_to([0, -1.7, 0])))
+        self.beat("So |d(L,n) − d(L,t)| ≤ d(n,t).")
 
-    def meeting(self):
-        diagram = self.map()
-        self.draw_route(diagram,['Arad','Sibiu','Fagaras','Bucharest'],GOLD)
-        self.say('Imagine finding this candidate first:\n450 km',GOLD)
-        self.draw_route(diagram,example()['ucs']['path'],GREEN)
-        self.say('Another journey costs 418 km.\nA first connection is not a proof.',GREEN)
-        self.say('Keep the cheapest complete route found so far.')
-        self.say('Call its cost μ.\nCould a cheaper route still remain?')
+    def sc_landmark(self):
+        self.title('One landmark, one triangle')
+        L = np.array([-4.6, -1.9, 0.0])
+        n = np.array([-2.1, 0.4, 0.0])
+        t = np.array([2.2, 0.5, 0.0])
 
-    def stop(self):
-        for y,text,color in [(1.4,'lower bound ≤ optimum',CYAN),
-                             (0,'optimum ≤ candidate μ',GOLD),
-                             (-1.4,'bounds meet → answer certified',GREEN)]:
-            self.play(FadeIn(label(text,25,color,width=6.1).move_to(LEFT*3.7+UP*y)),run_time=.7)
-            self.wait(1.5)
-        self.say('Each frontier minimum estimates the whole optimum.')
-        self.say('When either lower bound reaches μ, no cheaper route remains.')
-        self.equation('stop')
-        self.say('Do not sum two whole-trip bounds.\nReopen improved states.')
+        star = Star(n=5, outer_radius=0.2, color=GOLD, fill_opacity=1).set_z_index(5).move_to(L)
+        dn = Dot(n, color=CYAN, radius=0.1).set_z_index(5)
+        dt = Dot(t, color=GREEN, radius=0.1).set_z_index(5)
+        marks = VGroup(label('L', 22, GOLD).next_to(star, DOWN, buff=0.12),
+                       label('n', 22, CYAN).next_to(dn, LEFT, buff=0.12),
+                       label('t', 22, GREEN).next_to(dt, UP, buff=0.12))
+        poly = Polygon(L, n, t, color=CYAN, stroke_width=4)
+        seed = Triangle(color=CYAN, stroke_width=3).scale_to_fit_height(0.28).move_to(n)
 
-    def metrics(self):
-        ex = example()
-        values = [('UCS expansions',len(ex['ucs']['steps']),PURPLE),
-                  ('Bidir. expansions',len(ex['biastar']['steps'])-1,CYAN),
-                  ('UCS generated',ex['ucs']['generated'],PURPLE),
-                  ('Bidir. generated',ex['biastar']['generated'],CYAN)]
-        for i,(name,value,color) in enumerate(values):
-            y = 1.5-i*1.1
-            bar = Rectangle(width=value*.27,height=.18,stroke_width=0,fill_color=color,fill_opacity=1)
-            bar.move_to(LEFT*(6.8-bar.width/2)+UP*(y-.35))
-            self.play(FadeIn(label(f'{name}: {value}',22,color).move_to(LEFT*3.7+UP*y)),
-                      GrowFromEdge(bar,LEFT),run_time=.6)
-        self.say('Same journey.\nSame optimal cost: 418 km.',GREEN)
-        self.say('Fewer expansions can still mean more generated entries.')
-        self.say('Preprocessing costs work too.\nThis small map cannot prove scaling.')
-        self.say('UCS: explore by cost.\nA*: add an optimistic remainder.\nBidirectional A*: search both ends, then certify.',INK,25)
+        def morph():
+            self.play(FadeIn(star), FadeIn(dn), FadeIn(dt), FadeIn(marks), run_time=0.4)
+            self.play(ReplacementTransform(seed, poly), run_time=0.8)
+        self.beat("The landmark forms a triangle with n and t.", morph)
+
+        # Plain lines (no arrowheads) so the swiped arm does not leave a tip
+        # sitting on top of the red leftover segment.
+        arm_n = Line(L, n, color=CYAN, stroke_width=5).set_z_index(5)
+        arm_t = Line(L, t, color=GREEN, stroke_width=5).set_z_index(4)
+        ln = tag('d(L,n)', 20, CYAN).move_to((L + n) / 2 + LEFT * 0.85)
+        lt = tag('d(L,t)', 20, GREEN).move_to((L + t) / 2 + DOWN * 0.45)
+
+        def arms():
+            self.play(Create(arm_n), Create(arm_t), run_time=0.6)
+            self.play(FadeIn(ln), FadeIn(lt), run_time=0.3)
+        self.beat("Its arms measure distances to n and t.", arms)
+
+        def ang(v):
+            return np.arctan2(v[1], v[0])
+        delta = float(ang(n - L) - ang(t - L))
+
+        def swipe():
+            self.play(FadeOut(lt), Rotate(arm_t, angle=delta, about_point=L), run_time=1.1)
+        self.beat("Align the arms to compare their lengths.", swipe)
+
+        over = Line(n, arm_t.get_end(), color=RED, stroke_width=10).set_z_index(6)
+
+        def leftover():
+            self.play(Create(over), run_time=0.4)
+            self.add(tag('the leftover', 20, RED).move_to(over.get_center() + RIGHT * 0.6 + DOWN * 0.66))
+        self.beat("The red remainder is their length difference.", leftover)
+
+        def compare():
+            self.play(Create(Line(n, t, color=RED, stroke_width=5)), run_time=0.4)
+            self.add(tag('d(n,t)', 20, RED).move_to((n + t) / 2 + DOWN * 0.4))
+            x0, y1, y2 = 0.6, -1.45, -2.15
+            ol, nl = over.get_length(), float(np.linalg.norm(t - n))
+            ob = Line([x0, y1, 0], [x0 + ol, y1, 0], color=RED, stroke_width=9).set_z_index(6)
+            nb = Line([x0, y2, 0], [x0 + nl, y2, 0], color=RED, stroke_width=6).set_z_index(6)
+            self.play(Create(ob), Create(nb), run_time=0.5)
+            self.add(label('leftover', 18, RED).next_to(ob, UP, buff=0.08).align_to(ob, LEFT),
+                     label('d(n,t)', 18, RED).next_to(nb, DOWN, buff=0.08).align_to(nb, LEFT),
+                     VGroup(label('|', 24, INK), label('d(L,n)', 24, CYAN), label(' − ', 24, INK),
+                            label('d(L,t)', 24, GREEN), label('| ≤ ', 24, INK),
+                            label('d(n,t)', 24, RED)).arrange(RIGHT, buff=0.05).move_to([1.0, 3.4, 0]))
+        self.beat("That remainder cannot exceed d(n,t).", compare)
+
+    def sc_max(self):
+        self.title('Keep the maximum')
+        x0, span = -6.2, 6.4
+
+        def b1():
+            self.play(Create(Line([x0, 1.7, 0], [x0 + span, 1.7, 0], color=INK, stroke_width=4)), run_time=0.5)
+            self.add(label('true distance  d', 20, INK).move_to([x0 + 1.6, 1.95, 0]))
+        self.beat("Neither bound exceeds the true distance.", b1)
+
+        def b2():
+            self.bar(388 / 418, 0.6, PURPLE, 'LP   388', span, x0)
+            self.bar(418 / 418, -0.25, GOLD, 'ALT   418', span, x0)
+        self.beat("Take whichever bound is larger.", b2)
+        self.beat("Adding them could exceed the true distance.", lambda: self.play(
+            FadeIn(label('388 + 418  overestimates', 22, RED).move_to(RIGHT * 5.0 + UP * 1.0)), run_time=0.4))
+        self.beat("The maximum preserves both bounds' strengths.", lambda: self.play(
+            FadeIn(label('max  =  both, combined', 24, GREEN).move_to(RIGHT * 5.0 + DOWN * 0.5)), run_time=0.4))
+
+    def sc_tightness(self):
+        self.title('How tight is the bound')
+        x0, span = -5.4, 7.0
+
+        def b1():
+            self.play(Create(Line([x0, 1.5, 0], [x0 + span, 1.5, 0], color=INK, stroke_width=3)), run_time=0.4)
+            self.add(label('true distance  =  1.0', 20, INK).move_to([x0 + 2.0, 1.72, 0]))
+        self.beat("Compare each bound with the true distance.", b1)
+        self.beat("The LP bound reaches 0.73.", lambda: self.bar(0.73, 0.8, PURPLE, 'LP   0.73', span, x0))
+        self.beat("The landmark bound reaches 0.98.", lambda: self.bar(0.98, 0.0, GOLD, 'ALT   0.98', span, x0))
+        self.beat("Their maximum also reaches 0.98.",
+                  lambda: self.bar(0.98, -0.8, GREEN, 'max  ≥  0.98', span, x0))
+
+    def sc_race(self):
+        self.title('Watch it steer')
+        left = RoadMap(width=5.0, center=LEFT * 4.1 + UP * 0.1, initials=True)
+        right = RoadMap(width=5.0, center=RIGHT * 4.1 + UP * 0.1, initials=True)
+        ucs = DATA['demo']['algos']['ucs']['steps']
+        ast = DATA['demo']['algos']['astarAlt']['steps']
+        gL, gR = iter(ucs), iter(ast)
+        cL, cR = {'Arad': 0}, {'Arad': 0}
+        st = {'L': 0, 'R': 0, 'sL': None, 'sR': None}
+
+        def adv(dia, gen, costs, color, settle, n):
+            step = next(gen, None)
+            if step is None:
+                return n
+            cur = step['current']
+            self.play(Indicate(dia.nodes[cur], color=color, scale_factor=1.3), run_time=0.25)
+            if cur != 'Bucharest':          # stop expanding at the goal (no edges to U/G)
+                for e in DATA['graph'][cur]['edges']:
+                    nb = e['to']
+                    c = costs[cur] + e['km']
+                    if c < costs.get(nb, 1e9):
+                        costs[nb] = c
+                        self.add(Line(dia.points_by_city[cur], dia.points_by_city[nb], color=color, stroke_width=4).set_z_index(1))
+            n += 1
+            settle.set_value(n)
+            self.wait(0.12)
+            return n
+
+        def race():
+            self.add(label('uniform cost', 24, PURPLE).next_to(left, UP, buff=0.1),
+                     label('A*  (guided)', 24, GREEN).next_to(right, UP, buff=0.1))
+            st['sL'] = self.counter('explored', PURPLE, LEFT * 1.1 + UP * 2.6)
+            st['sR'] = self.counter('explored', GREEN, RIGHT * 1.1 + UP * 2.6)
+            for _ in range(len(ucs)):
+                st['L'] = adv(left, gL, cL, PURPLE, st['sL'], st['L'])
+                if st['R'] < len(ast):
+                    st['R'] = adv(right, gR, cR, GREEN, st['sR'], st['R'])
+        self.beat("The left search ranks by cost so far.", lambda: self.play(FadeIn(left), run_time=0.6))
+        self.beat("The right also estimates distance to the goal.", lambda: self.play(FadeIn(right), run_time=0.6))
+        self.beat("That guidance reduces the cities explored.", race)
+        self.beat("13 versus 5, with the same 418 km route.")
+
+    def sc_cutwork(self):
+        self.title('Does it cut the work?')
+        self.beat("These averages cover all 380 pairs.", lambda: self.bar(11, 1.0, PURPLE, 'uniform cost   11', 0.35, x0=-6.0))
+        self.beat("Average work falls from 11 to 5.", lambda: self.bar(5, 0.1, GREEN, 'A* (guided)   5', 0.35, x0=-6.0))
+        self.beat("Greedy is quicker, but wrong on 61 pairs.", lambda: self.bar(5, -0.8, RED, 'greedy   wrong on 61', 0.35, x0=-6.0))
+        self.beat("UCS and A* remain optimal on all pairs.",
+                  lambda: self.play(FadeIn(label('all optimal on 380 pairs', 24, GREEN).move_to(DOWN * 0.6)), run_time=0.4))
+
+    def sc_complexity(self):
+        self.title('Time and space')
+        CL, CR = -3.7, 3.7
+        Y = [1.7, 0.9, 0.1, -0.7]
+
+        def layout(cx):
+            return {
+                'root': np.array([cx, Y[0], 0]),
+                'l1': [np.array([cx + d, Y[1], 0]) for d in (-1.0, 1.0)],
+                'l2': [np.array([cx + d, Y[2], 0]) for d in (-1.5, -0.5, 0.5, 1.5)],
+                'l3': [np.array([cx + d, Y[3], 0]) for d in (-1.75, -1.25, -0.75, -0.25, 0.25, 0.75, 1.25, 1.75)],
+            }
+
+        def road(a, b, color='#53627A', w=2.4):
+            return Line(a, b, color=color, stroke_width=w).set_z_index(1)
+
+        def node(p, color=MUTED):
+            return Dot(p, radius=0.085, color=color).set_z_index(3)
+
+        def level_edges(P, i):
+            if i == 1:
+                return [(P['root'], P['l1'][0]), (P['root'], P['l1'][1])]
+            if i == 2:
+                return [(P['l1'][0], P['l2'][0]), (P['l1'][0], P['l2'][1]),
+                        (P['l1'][1], P['l2'][2]), (P['l1'][1], P['l2'][3])]
+            return [(P['l2'][k], P['l3'][2 * k]) for k in range(4)] + \
+                   [(P['l2'][k], P['l3'][2 * k + 1]) for k in range(4)]
+
+        def level_nodes(P, i):
+            return [P['root']] if i == 0 else P[f'l{i}']
+
+        L, R = layout(CL), layout(CR)
+        timeL = label('time      O(b^d)', 20, PURPLE).move_to([CL, -1.35, 0])
+        spaceL = label('space     O(b^d)', 20, PURPLE).move_to([CL, -1.85, 0])
+        timeR = label('time      O(b^d)', 20, GREEN).move_to([CR, -1.35, 0])
+        spaceR = label('space     O(b^d)', 20, GREEN).move_to([CR, -1.85, 0])
+
+        def start():
+            self.play(FadeIn(label('blind search', 22, PURPLE).move_to([CL, 2.6, 0])),
+                      FadeIn(label('A*  (heuristic)', 22, GREEN).move_to([CR, 2.6, 0])), run_time=0.4)
+            self.play(FadeIn(node(L['root'], PURPLE)), run_time=0.2)
+            for i in (1, 2, 3):
+                self.play(LaggedStart(*[Create(road(a, b)) for a, b in level_edges(L, i)],
+                                      *[FadeIn(node(p, PURPLE)) for p in level_nodes(L, i)],
+                                      lag_ratio=0.1), run_time=0.55)
+        self.beat("Unguided search fills all 15 nodes here.", start)
+
+        self.beat("Worst-case time and space are both O(b^d).",
+                  lambda: self.play(FadeIn(timeL), FadeIn(spaceL), run_time=0.4))
+
+        def narrow():
+            path = [(R['root'], R['l1'][0]), (R['l1'][0], R['l2'][0]), (R['l2'][0], R['l3'][0])]
+            self.play(LaggedStart(*[Create(road(a, b, GREEN, 3.5)) for a, b in path],
+                                  *[FadeIn(node(p, GREEN)) for p in (R['root'], R['l1'][0], R['l2'][0])],
+                                  lag_ratio=0.15), run_time=0.7)
+            self.play(FadeIn(node(R['l3'][0], GREEN)),
+                      FadeIn(Star(n=5, outer_radius=0.16, color=GREEN, fill_opacity=1).move_to(R['l3'][0])),
+                      run_time=0.3)
+            self.play(Create(road(R['root'], R['l1'][1], GOLD, 3.0)),
+                      FadeIn(node(R['l1'][1], GOLD)), run_time=0.35)
+            self.add(self.token([R['root'], R['l1'][0], R['l2'][0], R['l3'][0]], GREEN, speed=1.2))
+        self.beat("A*'s estimate focuses this search on 5 nodes.", narrow)
+
+        self.beat("That is a third as many expansions here.",
+                  lambda: self.play(FadeIn(card('15 nodes', PURPLE, w=2.0, size=20).move_to([CL, 2.15, 0])),
+                                    FadeIn(card('5 nodes   3x fewer', GREEN, w=3.1, size=18).move_to([CR, 2.15, 0])),
+                                    FadeIn(timeR), FadeIn(spaceR), run_time=0.5))
+
+        self.beat("Its frontier can still need O(b^d) memory.",
+                  lambda: self.play(FadeIn(tag('same memory', 20, GOLD).move_to([0, -1.85, 0])),
+                                    Indicate(spaceL, color=PURPLE), Indicate(spaceR, color=GREEN),
+                                    run_time=0.7))
+
+    def sc_guarantee(self):
+        self.title('Why an honest guess stays optimal')
+        self.beat("Suppose A* chooses the 450 route too soon.",
+                  lambda: self.bar(450, -1.0, PURPLE, 'selected goal   450', 6.0 / 450, x0=-6.4))
+        self.beat("The 418 route still has a frontier city.",
+                  lambda: self.bar(418, 0.2, GREEN, 'optimal   418', 6.0 / 450, x0=-6.4))
+        self.beat("That city's f cannot exceed 418.",
+                  lambda: self.bar(418, 1.2, GOLD, 'frontier  ≤  418', 6.0 / 450, x0=-6.4))
+        self.beat("It must come first, a contradiction.",
+                  lambda: self.add(label('contradiction  →  optimal', 24, GREEN).move_to(RIGHT * 3.6 + UP * 0.5)))
+
+    def sc_bothends(self):
+        self.title('Search from both ends')
+        box = {}
+        self.beat("We can also explore from both endpoints.", lambda: box.__setitem__('d', self.diagram(width=7.0)))
+
+        def fronts():
+            d = box['d']
+            costs = [{'Arad': 0}, {'Bucharest': 0}]
+            for i, step in enumerate(DATA['demo']['algos']['biastar']['steps'][:-1]):
+                side = i % 2
+                color = [CYAN, GOLD][side]
+                cur = step['current']
+                self.play(Indicate(d.nodes[cur], color=color, scale_factor=1.3), run_time=0.3)
+                for e in DATA['graph'][cur]['edges']:
+                    nb = e['to']
+                    c = costs[side][cur] + e['km']
+                    if c < costs[side].get(nb, 1e9):
+                        costs[side][nb] = c
+                        self.add(Line(d.points_by_city[cur], d.points_by_city[nb], color=color, stroke_width=4).set_z_index(1))
+            route = [d.points_by_city[c] for c in ['Arad', 'Sibiu', 'Rimnicu Vilcea', 'Pitesti', 'Bucharest']]
+            self.add(self.token(route, CYAN, speed=1.4), self.token(route[::-1], GOLD, speed=1.4))
+        self.beat("Begin a second search at Bucharest.", fronts)
+        self.beat("Joining the fronts gives a candidate route.",
+                  lambda: self.add(label('the fronts meet  →  a route', 24, GREEN).move_to(RIGHT * 3.3 + UP * 0.6)))
+        self.beat("A meeting alone does not prove it optimal.")
+
+    def sc_stop(self):
+        self.title('When can we stop?')
+        box = {}
+
+        def b1():
+            box['bound'] = self.counter('frontier bound', GOLD, LEFT * 4.2 + UP * 0.6)
+            box['best'] = self.counter('best route found', GREEN, RIGHT * 4.2 + UP * 0.6)
+            box['best'].set_value(418)
+        self.beat("Could an unfinished route still be cheaper?", b1)
+        self.beat("The frontier bound limits unfinished routes.", lambda: box['bound'].set_value(120))
+        self.beat("Stop when the bound reaches the route cost.",
+                  lambda: self.play(box['bound'].animate.set_value(418), run_time=1.6))
+        self.beat("At 418, no cheaper route can remain.",
+                  lambda: self.add(label('reaches it  →  stop', 26, GREEN).move_to(DOWN * 0.6)))
+
+    # ── implementation section ────────────────────────────────────────────────
+    def sc_code_search(self):
+        self.title('Inside the search')
+        code = code_panel(UCS_SRC).move_to(LEFT * 3.55 + UP * 0.45)
+        self.play(FadeIn(code), run_time=0.5)
+        fx = RIGHT * 4.4
+        self.add(label('frontier', 22, MUTED).move_to(fx + UP * 2.45))
+        arad = card('Arad   0', PURPLE, w=2.6).move_to(fx + UP * 1.65)
+        self.beat("Pending routes share a frontier list.",
+                  lambda: self.play(FadeIn(arad), run_time=0.4))
+
+        def take():
+            b = hl_lines(code, 1, 2)
+            self.play(Create(b), run_time=0.35)
+            self.play(FadeOut(arad), FadeOut(b), run_time=0.3)
+        self.beat("Sort by cost and remove the first entry.", take)
+
+        def relax():
+            b = hl_lines(code, 6, 9, GREEN)
+            self.play(Create(b), run_time=0.4)
+            sib = card('Sibiu   140', GREEN, w=2.6).move_to(fx + UP * 1.0)
+            tim = card('Timisoara   118', GREEN, w=2.6).move_to(fx + UP * 0.44)
+            zer = card('Zerind   75', GREEN, w=2.6).move_to(fx + DOWN * 0.12)
+            self.play(*[FadeIn(c, shift=UP * 0.1) for c in (sib, tim, zer)], run_time=0.4)
+            self.wait(0.2)
+            self.play(zer.animate.move_to(fx + UP * 1.0), sib.animate.move_to(fx + DOWN * 0.12),
+                      run_time=0.5)
+            self.play(FadeOut(b), run_time=0.2)
+        self.beat("Update neighbours when a cheaper route appears.", relax)
+        self.beat("The lowest-cost route stays at the front.")
+
+    def sc_code_astar(self):
+        self.title('Adding the guess')
+        code = code_panel(ASTAR_SRC).move_to(LEFT * 3.55 + UP * 0.45)
+        self.play(FadeIn(code), run_time=0.5)
+        fx = RIGHT * 4.4
+        self.add(VGroup(label('f', 26, GREEN), label(' = ', 26, INK), label('g', 26, PURPLE),
+                        label(' + ', 26, INK), label('h', 26, GOLD)).arrange(RIGHT, buff=0.06)
+                 .move_to(fx + UP * 2.45),
+                 label('frontier   g → f', 20, MUTED).move_to(fx + UP * 1.95))
+
+        sib = card('Sibiu   140 → 418', GREEN, w=2.9, size=16).move_to(fx + UP * 1.25)
+        zer = card('Zerind   75 → 568', GOLD, w=2.9, size=16).move_to(fx + UP * 0.62)
+        tim = card('Timisoara   118 → 654', MUTED, w=2.9, size=16).move_to(fx + DOWN * 0.01)
+        self.beat("Sibiu's cost 140 becomes an f of 418.",
+                  lambda: self.play(FadeIn(sib), run_time=0.4))
+
+        def smallest():
+            b = hl_lines(code, 1, 3)
+            c = hl_lines(code, 5, 5, CYAN)
+            self.play(Create(b), Create(c), run_time=0.4)
+            self.play(Indicate(sib, color=GREEN, scale_factor=1.08), run_time=0.5)
+            self.play(FadeOut(b), FadeOut(c), run_time=0.2)
+        self.beat("Each turn takes the entry with smallest f.", smallest)
+
+        def nearer():
+            self.play(FadeIn(zer, shift=UP * 0.1), FadeIn(tim, shift=UP * 0.1), run_time=0.35)
+            self.play(Indicate(zer, color=GOLD), run_time=0.5)
+        self.beat("Zerind costs only 75, but its f is 568.", nearer)
+
+        def stale():
+            b = hl_lines(code, 7, 7, RED)
+            old = card('Zerind   568', MUTED, w=2.9, size=16).move_to(fx + DOWN * 0.66)
+            cross = Line(old.get_corner(DL) + RIGHT * 0.1, old.get_corner(UR) + LEFT * 0.1,
+                         color=RED, stroke_width=3)
+            self.play(Create(b), FadeIn(old), Create(cross), run_time=0.4)
+            self.play(FadeOut(b), FadeOut(old), FadeOut(cross), run_time=0.3)
+        self.beat("Discard stale entries with higher costs.", stale)
+
+        def push():
+            b = hl_lines(code, 10, 11, GOLD)
+            new = card('Rimnicu V.   220 → 418', GREEN, w=2.9, size=16).move_to(fx + DOWN * 0.62)
+            self.play(Create(b), run_time=0.35)
+            self.play(FadeIn(new, shift=UP * 0.1), run_time=0.3)
+            self.play(FadeOut(b), run_time=0.2)
+        self.beat("Timisoara enters at cost 118, with f 654.", push)
+
+    def sc_code_bounds(self):
+        self.title('Where the guess comes from')
+        code = code_panel(BOUNDS_SRC).move_to(LEFT * 3.55 + UP * 0.45)
+        self.play(FadeIn(code), run_time=0.5)
+        fx = RIGHT * 4.2
+        lp = card('LP table   388', PURPLE, w=2.9).move_to(RIGHT * 2.7 + UP * 1.05)
+        alt = card('landmarks   418', GOLD, w=3.0).move_to(RIGHT * 6.0 + UP * 1.05)
+        best = card('take the larger   418', GREEN, w=4.2).move_to(fx + DOWN * 0.75)
+
+        def two():
+            self.play(FadeIn(lp), FadeIn(alt), run_time=0.4)
+            self.play(GrowArrow(Arrow(lp.get_bottom(), best.get_corner(UL) + LEFT * 0.2, buff=0.08,
+                                      color=PURPLE, stroke_width=4)),
+                      GrowArrow(Arrow(alt.get_bottom(), best.get_corner(UR) + RIGHT * 0.2, buff=0.08,
+                                      color=GOLD, stroke_width=4)), run_time=0.5)
+            self.play(FadeIn(best), run_time=0.4)
+        self.beat("The estimate takes the maximum of two bounds.", two)
+
+        def read_table():
+            b = hl_lines(code, 1, 1)
+            self.play(Create(b), Indicate(lp, color=PURPLE), run_time=0.6)
+            self.play(FadeOut(b), run_time=0.2)
+        self.beat("The offline LP table supplies 388.", read_table)
+
+        def landmarks():
+            b = hl_lines(code, 4, 6, CYAN)
+            self.play(Create(b), Indicate(alt, color=GOLD), run_time=0.6)
+            self.play(FadeOut(b), run_time=0.2)
+        self.beat("Landmark distances supply 418.", landmarks)
+        self.beat("Taking 418 preserves the lower-bound guarantee.",
+                  lambda: self.play(Create(hl_lines(code, 9, 9, GREEN)), run_time=0.5))
+
+    def sc_code_table(self):
+        self.title('The table is built once')
+        code = code_panel(LINPROG_SRC).move_to(LEFT * 3.55 + UP * 0.35)
+        self.play(FadeIn(code), run_time=0.5)
+        fx = RIGHT * 4.5
+        boxes = [card('map of Romania', MUTED, w=3.0, size=19).move_to(fx + UP * 2.5),
+                 card('46 road arrows', CYAN, w=3.0, size=19).move_to(fx + UP * 1.55),
+                 card('LP solver', PURPLE, w=3.0, size=19).move_to(fx + UP * 0.6),
+                 card('table   388', GREEN, w=3.0, size=19).move_to(fx + DOWN * 0.35)]
+        links = [Arrow(boxes[i].get_bottom(), boxes[i + 1].get_top(), buff=0.06,
+                       color=INK, stroke_width=3) for i in range(3)]
+
+        def pipe():
+            self.play(LaggedStart(*[FadeIn(b) for b in boxes], lag_ratio=0.15),
+                      LaggedStart(*[GrowArrow(a) for a in links], lag_ratio=0.15), run_time=0.7)
+        self.beat("Precompute the LP bounds before searching.", pipe)
+
+        def arrows():
+            b = hl_lines(code, 1, 3)
+            self.play(Create(b), Indicate(boxes[1], color=CYAN), run_time=0.6)
+            self.play(FadeOut(b), run_time=0.2)
+        self.beat("Encode the map as 46 weighted arrows.", arrows)
+
+        def solve():
+            b = hl_lines(code, 4, 6)
+            self.play(Create(b), Indicate(boxes[2], color=PURPLE), run_time=0.6)
+            self.play(FadeOut(b), run_time=0.2)
+        self.beat("Minimise the cost of a fractional mixture.", solve)
+        self.beat("Store results such as 388 in the table.",
+                  lambda: self.play(Create(hl_lines(code, 9, 9, GREEN)),
+                                    Indicate(boxes[3], color=GREEN), run_time=0.7))
+
+    def sc_code_both(self):
+        self.title('Two fronts, one answer')
+        code = code_panel(BOTH_SRC).move_to(LEFT * 3.55 + UP * 0.35)
+        self.play(FadeIn(code), run_time=0.5)
+        fx = RIGHT * 4.5
+        lc = [card('Sibiu   140', CYAN, w=2.7, size=18).move_to(fx + LEFT * 1.55 + UP * 1.55),
+              card('Rimnicu   220', CYAN, w=2.7, size=18).move_to(fx + LEFT * 1.55 + UP * 0.95)]
+        rc = [card('Pitesti   101', GOLD, w=2.7, size=18).move_to(fx + RIGHT * 1.55 + UP * 1.55),
+              card('Fagaras   211', GOLD, w=2.7, size=18).move_to(fx + RIGHT * 1.55 + UP * 0.95)]
+        badge = card('the best route   418', GREEN, w=4.2).move_to(fx + DOWN * 0.7)
+
+        def two():
+            self.play(FadeIn(label('from Arad', 19, CYAN).move_to(fx + LEFT * 1.55 + UP * 2.1)),
+                      FadeIn(label('from Bucharest', 19, GOLD).move_to(fx + RIGHT * 1.55 + UP * 2.1)),
+                      *[FadeIn(c, shift=UP * 0.1) for c in lc + rc], run_time=0.5)
+        self.beat("Maintain a search from each endpoint.", two)
+
+        def combine():
+            b = hl_lines(code, 1, 1)
+            self.play(Create(b), run_time=0.4)
+            self.play(GrowArrow(Arrow(lc[1].get_bottom(), badge.get_corner(UL) + LEFT * 0.2, buff=0.1,
+                                      color=CYAN, stroke_width=4)),
+                      GrowArrow(Arrow(rc[1].get_bottom(), badge.get_corner(UR) + RIGHT * 0.2, buff=0.1,
+                                      color=GOLD, stroke_width=4)), run_time=0.5)
+            self.play(FadeOut(b), run_time=0.2)
+        self.beat("Each front bounds the whole trip.", combine)
+
+        def halt():
+            b = hl_lines(code, 5, 6, GREEN)
+            self.play(Create(b), run_time=0.4)
+            self.play(FadeIn(badge, shift=UP * 0.08), run_time=0.4)
+            self.play(FadeOut(b), run_time=0.2)
+        self.beat("Stop when a bound meets the best route.", halt)
+
+    def sc_recap(self):
+        self.title('What we gained')
+        self.beat("Cost alone takes 13 expansions here.", lambda: self.play(
+            FadeIn(label('explore by cost', 30, PURPLE).move_to(UP * 1.2)), run_time=0.4))
+        self.beat("A lower-bound estimate guides the search.", lambda: self.play(
+            FadeIn(label('guide with a safe estimate', 30, GOLD).move_to(UP * 0.3)), run_time=0.4))
+        self.beat("Search both ends, then certify when to stop.", lambda: (
+            self.play(FadeIn(label('combine two bounds', 30, GREEN).move_to(DOWN * 0.6)), run_time=0.4),
+            self.play(FadeIn(label('search both ends', 30, CYAN).move_to(DOWN * 1.5)), run_time=0.4)))
+        self.beat("5 expansions, the same 418 km route.", lambda: self.play(
+            FadeIn(card('13 expansions', PURPLE, w=2.8, size=22).move_to(LEFT * 2.9 + DOWN * 2.4)),
+            FadeIn(label('same 418 km route', 22, INK).move_to(DOWN * 2.4)),
+            FadeIn(card('5 expansions', GREEN, w=2.8, size=22).move_to(RIGHT * 2.9 + DOWN * 2.4)),
+            run_time=0.5))
