@@ -21,7 +21,8 @@ from scene_kit import RoadMap, DATA, label, INK, MUTED, CYAN, GOLD, GREEN, PURPL
 from manim import *  # noqa: E402
 
 FONT = 'Avenir Next'
-CHAR = ROOT.parent / 'character'
+# CHAR = ROOT.parent / 'character'
+CHAR = '/Users/nukerducker/Code/romania-video/character'
 MAXW = 11.8
 AUDIT = bool(os.environ.get('AUDIT'))
 
@@ -187,6 +188,7 @@ class Film(Scene):
     SPS = 4.2     # syllables per second -> each block's hold (calm 3b1b pace)
     MIN_HOLD = 0.8
     END = 1.1     # hold on a scene's final frame
+    TAIL = 1.5    # seconds of empty background held after the end-of-scene fade
 
     def play(self, *animations, **kwargs):
         if 'run_time' in kwargs:
@@ -288,6 +290,7 @@ class Film(Scene):
             self._sub = None
             self._scene = name
             self._hits = {}
+            self.tail = self.TAIL
             self._speaker(WHO[name])
             getattr(self, name)()
             if AUDIT and self._hits:
@@ -295,22 +298,29 @@ class Film(Scene):
                 for (kind, what, gt), frac in sorted(self._hits.items(), key=lambda kv: -kv[1])[:12]:
                     print(f'    {frac:4.2f} frac  {kind:9s} "{what}"  x  {gt}')
             self.wait(self.END)
+            # Counters carry a `become()` updater that resets opacity every frame,
+            # so the FadeOut never bites on them. Drop updaters before fading.
+            for m in self.mobjects:
+                m.clear_updaters()
             self.play(*[FadeOut(m) for m in self.mobjects], run_time=0.3)
+            self.wait(self.tail)
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _speaker(self, who):
         self.mc = None
         xs = [LEFT * 6.55, LEFT * 5.75]
+        cast = []
         for i, name in enumerate(who):
-            m = ImageMobject(str(CHAR / f'cast_{name}.png')).set_z_index(20)
-            m.scale_to_fit_height(0.72)
+            m = ImageMobject(f'{CHAR}/cast_{name}.png').set_z_index(20)
+            m.scale_to_fit_height(0.92)
             m.move_to(xs[i] + DOWN * 2.75)
             base = m.get_center().copy()
             m.add_updater(lambda mm, b=base: mm.move_to(
                 b + UP * 0.20 * np.sin(self.time * 2.3) + RIGHT * 0.12 * np.sin(self.time * 3.5)))
-            self.add(m)
+            cast.append(m)
             if self.mc is None:
                 self.mc = m
+        self.play(*[FadeIn(m) for m in cast], run_time=0.5)
 
     def sub(self, text):
         s = subtitle(text)
@@ -383,13 +393,13 @@ class Film(Scene):
         box, drawn = {}, {}
 
         def start():
-            box['d'] = self.diagram()
+            box['d'] = self.diagram(center=LEFT * 1.8 + UP * 0.2)
             self.play(Indicate(box['d'].nodes['Arad'], color=GREEN),
                       Indicate(box['d'].nodes['Bucharest'], color=RED), run_time=0.6)
         self.beat("From Arad, we want to reach Bucharest.", start)
 
         def gold():
-            t1 = self.counter("", GOLD, RIGHT * 3.4 + UP * 1.1, unit=" km")
+            t1 = self.counter("", GOLD, RIGHT * 4.3 + UP * 1.1, unit=" km")
             tot = 0
             for a, b in zip(r1, r1[1:]):
                 tot += km(a, b)
@@ -400,7 +410,7 @@ class Film(Scene):
         self.beat("Yet those three roads cost 450 kilometres.")
 
         def purple():
-            t2 = self.counter("", PURPLE, RIGHT * 3.4 + UP * 0.2, unit=" km")
+            t2 = self.counter("", PURPLE, RIGHT * 4.3 + UP * 0.2, unit=" km")
             tot = 0
             for a, b in zip(r2, r2[1:]):
                 tot += km(a, b)
@@ -458,23 +468,26 @@ class Film(Scene):
 
     def sc_ucsproof(self):
         self.title('Why cheapest-first works')
-        pts = [LEFT * 6.0 + UP * 0.4, LEFT * 1.6 + UP * 0.4, RIGHT * 3.0 + UP * 0.4]
+        pts = [LEFT * 4.5 + UP * 0.4, LEFT * 0.1 + UP * 0.4, RIGHT * 4.5 + UP * 0.4]
         for p, t in zip(pts, ['start', 'frontier', 'goal']):
             self.add(Dot(p, color=PURPLE), label(t, 20, MUTED).next_to(p, DOWN, buff=0.25))
         self.beat("Why does choosing by cost work?",
                   lambda: self.play(Create(Line(pts[0], pts[1], color=PURPLE, stroke_width=5)), run_time=0.5))
         self.beat("Suppose it chooses a goal too soon.",
-                  lambda: (self.play(Create(Line(pts[0], pts[2], color=GREEN, stroke_width=5)), run_time=0.5),
-                           self.add(self.token([pts[0], pts[2]], INK)),
-                           self.add(tag('picked first', 18, GREEN).move_to((pts[0] + pts[2]) / 2 + UP * 0.45))))
+                  lambda: self.play(Create(Line(pts[0], pts[2], color=GREEN, stroke_width=5)),
+                                    FadeIn(self.token([pts[0], pts[2]], INK)),
+                                    FadeIn(tag('picked first', 18, GREEN).move_to((pts[0] + pts[2]) / 2 + UP * 0.45)),
+                                    run_time=0.5))
         self.beat("A cheaper route must remain unfinished.",
-                  lambda: (self.play(Create(DashedLine(pts[1], pts[2], color=GOLD)), run_time=0.5),
-                           self.add(self.token([pts[0], pts[1], pts[2]], GOLD)),
-                           self.add(tag('still hidden', 18, GOLD).move_to((pts[1] + pts[2]) / 2 + DOWN * 0.5))))
+                  lambda: self.play(Create(DashedLine(pts[1], pts[2], color=GOLD)),
+                                    FadeIn(self.token([pts[0], pts[1], pts[2]], GOLD)),
+                                    FadeIn(tag('still hidden', 18, GOLD).move_to((pts[1] + pts[2]) / 2 + DOWN * 0.5)),
+                                    run_time=0.5))
         self.beat("Its frontier city has a lower cost.",
                   lambda: self.play(Indicate(Dot(pts[1], color=GOLD), color=GOLD), run_time=0.6))
         self.beat("That city must come first, a contradiction.",
-                  lambda: self.add(label('chosen first  →  contradiction', 22, RED).move_to(DOWN * 1.3)))
+                  lambda: self.play(FadeIn(label('chosen first  →  contradiction', 22, RED).move_to(DOWN * 1.3)),
+                                    run_time=0.4))
 
     def sc_estimate(self):
         self.title('Guide with an estimate')
@@ -505,11 +518,11 @@ class Film(Scene):
 
         def b3():
             self.play(*[FadeOut(m) for m in [d, *lbls]], run_time=0.4)
-            self.bar(220, 1.5, PURPLE, 'g  already paid   220', 6.0 / 450)
-            self.bar(198, 0.5, GOLD, 'h  estimated left   198', 6.0 / 450)
+            self.bar(220, 1.5, PURPLE, 'g  already paid   220', 6.0 / 450, x0=-2.79)
+            self.bar(198, 0.5, GOLD, 'h  estimated left   198', 6.0 / 450, x0=-2.79)
         self.beat("Combine cost so far with cost still to come.", b3)
         self.beat("A* ranks routes by their sum: f = g + h.",
-                  lambda: self.bar(418, -0.6, GREEN, 'f = g + h   418', 6.0 / 450))
+                  lambda: self.bar(418, -0.6, GREEN, 'f = g + h   418', 6.0 / 450, x0=-2.79))
 
     def sc_twoways(self):
         self.title('Two ways to estimate the rest')
@@ -535,7 +548,7 @@ class Film(Scene):
 
     def sc_lpproof(self):
         self.title('Why the LP is a lower bound')
-        width, center = 7.6, RIGHT * 1.5 + UP * 0.35
+        width, center = 7.6, RIGHT * 0.6 + UP * 0.35
         cities = ['Arad', 'Sibiu', 'Rimnicu Vilcea', 'Pitesti', 'Bucharest']
         pt = {c: np.array([(DATA['graph'][c]['x'] - 2043) / 2540 * width,
                            -(DATA['graph'][c]['y'] - 1254) / 2540 * width, 0]) + center
@@ -597,13 +610,13 @@ class Film(Scene):
         chain.clear_updaters()
         kml.clear_updaters()
         self.beat("This minimum cannot exceed a real route's cost.",
-                  lambda: self.play(FadeIn(label('never overshoots the goal', 24, GREEN).move_to(RIGHT * 4.6 + UP * 2.0)), run_time=0.4))
+                  lambda: self.play(FadeIn(label('never overshoots the goal', 24, GREEN).move_to(RIGHT * 3.7 + UP * 2.0)), run_time=0.4))
 
     def sc_triangle(self):
         self.title('Why subtract landmark distances')
-        L = LEFT * 5.4 + UP * 1.3
-        n = LEFT * 6.2 + DOWN * 1.2
-        t = RIGHT * 0.8 + DOWN * 1.2
+        L = LEFT * 2.8 + UP * 1.3
+        n = LEFT * 3.6 + DOWN * 1.2
+        t = RIGHT * 3.4 + DOWN * 1.2
         for p, name, d in [(L, 'L', UP), (n, 'n', DOWN), (t, 't', UP)]:
             self.add(Dot(p, color=MUTED), label(name, 24).next_to(p, d, buff=0.15))
         self.beat("Why use the difference in distances?",
@@ -687,7 +700,7 @@ class Film(Scene):
 
     def sc_max(self):
         self.title('Keep the maximum')
-        x0, span = -6.2, 6.4
+        x0, span = -3.2, 6.4
 
         def b1():
             self.play(Create(Line([x0, 1.7, 0], [x0 + span, 1.7, 0], color=INK, stroke_width=4)), run_time=0.5)
@@ -699,13 +712,13 @@ class Film(Scene):
             self.bar(418 / 418, -0.25, GOLD, 'ALT   418', span, x0)
         self.beat("Take whichever bound is larger.", b2)
         self.beat("Adding them could exceed the true distance.", lambda: self.play(
-            FadeIn(label('388 + 418  overestimates', 22, RED).move_to(RIGHT * 5.0 + UP * 1.0)), run_time=0.4))
+            FadeIn(label('388 + 418  overestimates', 22, RED).move_to(DOWN * 1.3)), run_time=0.4))
         self.beat("The maximum preserves both bounds' strengths.", lambda: self.play(
-            FadeIn(label('max  =  both, combined', 24, GREEN).move_to(RIGHT * 5.0 + DOWN * 0.5)), run_time=0.4))
+            FadeIn(label('max  =  both, combined', 24, GREEN).move_to(DOWN * 2.1)), run_time=0.4))
 
     def sc_tightness(self):
         self.title('How tight is the bound')
-        x0, span = -5.4, 7.0
+        x0, span = -3.5, 7.0
 
         def b1():
             self.play(Create(Line([x0, 1.5, 0], [x0 + span, 1.5, 0], color=INK, stroke_width=3)), run_time=0.4)
@@ -760,11 +773,11 @@ class Film(Scene):
 
     def sc_cutwork(self):
         self.title('Does it cut the work?')
-        self.beat("These averages cover all 380 pairs.", lambda: self.bar(11, 1.0, PURPLE, 'uniform cost   11', 0.35, x0=-6.0))
-        self.beat("Average work falls from 11 to 5.", lambda: self.bar(5, 0.1, GREEN, 'A* (guided)   5', 0.35, x0=-6.0))
-        self.beat("Greedy is quicker, but wrong on 61 pairs.", lambda: self.bar(5, -0.8, RED, 'greedy   wrong on 61', 0.35, x0=-6.0))
+        self.beat("These averages cover all 380 pairs.", lambda: self.bar(11, 1.0, PURPLE, 'uniform cost   11', 0.35, x0=-2.5))
+        self.beat("Average work falls from 11 to 5.", lambda: self.bar(5, 0.1, GREEN, 'A* (guided)   5', 0.35, x0=-2.5))
+        self.beat("Greedy is quicker, but wrong on 61 pairs.", lambda: self.bar(5, -0.8, RED, 'greedy   wrong on 61', 0.35, x0=-2.5))
         self.beat("UCS and A* remain optimal on all pairs.",
-                  lambda: self.play(FadeIn(label('all optimal on 380 pairs', 24, GREEN).move_to(DOWN * 0.6)), run_time=0.4))
+                  lambda: self.play(FadeIn(label('all optimal on 380 pairs', 24, GREEN).move_to(DOWN * 1.9)), run_time=0.4))
 
     def sc_complexity(self):
         self.title('Time and space')
@@ -842,18 +855,19 @@ class Film(Scene):
     def sc_guarantee(self):
         self.title('Why an honest guess stays optimal')
         self.beat("Suppose A* chooses the 450 route too soon.",
-                  lambda: self.bar(450, -1.0, PURPLE, 'selected goal   450', 6.0 / 450, x0=-6.4))
+                  lambda: self.bar(450, -1.0, PURPLE, 'selected goal   450', 6.0 / 450, x0=-3.0))
         self.beat("The 418 route still has a frontier city.",
-                  lambda: self.bar(418, 0.2, GREEN, 'optimal   418', 6.0 / 450, x0=-6.4))
+                  lambda: self.bar(418, 0.2, GREEN, 'optimal   418', 6.0 / 450, x0=-3.0))
         self.beat("That city's f cannot exceed 418.",
-                  lambda: self.bar(418, 1.2, GOLD, 'frontier  ≤  418', 6.0 / 450, x0=-6.4))
+                  lambda: self.bar(418, 1.2, GOLD, 'frontier  ≤  418', 6.0 / 450, x0=-3.0))
         self.beat("It must come first, a contradiction.",
-                  lambda: self.add(label('contradiction  →  optimal', 24, GREEN).move_to(RIGHT * 3.6 + UP * 0.5)))
+                  lambda: self.add(label('contradiction  →  optimal', 24, GREEN).move_to(DOWN * 2.0)))
 
     def sc_bothends(self):
         self.title('Search from both ends')
         box = {}
-        self.beat("We can also explore from both endpoints.", lambda: box.__setitem__('d', self.diagram(width=7.0)))
+        self.beat("We can also explore from both endpoints.",
+                  lambda: box.__setitem__('d', self.diagram(width=7.0, center=LEFT * 1.4 + UP * 0.2)))
 
         def fronts():
             d = box['d']
@@ -873,7 +887,7 @@ class Film(Scene):
             self.add(self.token(route, CYAN, speed=1.4), self.token(route[::-1], GOLD, speed=1.4))
         self.beat("Begin a second search at Bucharest.", fronts)
         self.beat("Joining the fronts gives a candidate route.",
-                  lambda: self.add(label('the fronts meet  →  a route', 24, GREEN).move_to(RIGHT * 3.3 + UP * 0.6)))
+                  lambda: self.add(label('the fronts meet  →  a route', 24, GREEN).move_to(RIGHT * 4.2 + UP * 0.6)))
         self.beat("A meeting alone does not prove it optimal.")
 
     def sc_stop(self):
@@ -905,6 +919,7 @@ class Film(Scene):
         def take():
             b = hl_lines(code, 1, 2)
             self.play(Create(b), run_time=0.35)
+            self.wait(0.9)          # let the highlight linger before it clears
             self.play(FadeOut(arad), FadeOut(b), run_time=0.3)
         self.beat("Sort by cost and remove the first entry.", take)
 
