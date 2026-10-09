@@ -21,7 +21,7 @@ from scene_kit import RoadMap, DATA, label, INK, MUTED, CYAN, GOLD, GREEN, PURPL
 from manim import *  # noqa: E402
 
 FONT = 'Avenir Next'
-CHAR = ROOT.parent / 'assets' / 'Character'
+CHAR = ROOT.parent / 'character'
 MAXW = 11.8
 AUDIT = bool(os.environ.get('AUDIT'))
 
