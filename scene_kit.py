@@ -15,7 +15,7 @@ DATA = json.loads((ROOT / 'project_data.json').read_text())
 
 INK, MUTED = '#F4F1EA', '#C4C1B9'
 CYAN, GOLD, GREEN, PURPLE, RED = '#55D6BE', '#F2C14E', '#8BE28B', '#B39DDB', '#F07167'
-config.background_color = '#101010'
+config.background_color = '#000000'
 config.frame_width = 16
 config.frame_height = 9
 
