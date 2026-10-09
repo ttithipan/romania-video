@@ -21,8 +21,7 @@ from scene_kit import RoadMap, DATA, label, INK, MUTED, CYAN, GOLD, GREEN, PURPL
 from manim import *  # noqa: E402
 
 FONT = 'Avenir Next'
-# CHAR = ROOT.parent / 'character'
-CHAR = '/Users/nukerducker/Code/romania-video/character'
+CHAR = ROOT / 'character'   # resolved relative to film.py, so the repo is portable
 MAXW = 11.8
 AUDIT = bool(os.environ.get('AUDIT'))
 
