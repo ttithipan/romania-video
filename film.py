@@ -8,6 +8,7 @@ Render (from romania-video):
     ./render.sh scenes             # one mp4 per scene
     SCENES=sc_race .venv/bin/python -m manim -qh film.py Film   # one scene
 """
+import json
 import os
 import re
 import sys
@@ -17,6 +18,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
+VO_DEBUG = bool(os.environ.get('VO_DEBUG'))
 from scene_kit import RoadMap, DATA, label, INK, MUTED, CYAN, GOLD, GREEN, PURPLE, RED  # noqa: E402
 from manim import *  # noqa: E402
 
@@ -24,6 +26,27 @@ FONT = 'Avenir Next'
 CHAR = ROOT / 'character'   # resolved relative to film.py, so the repo is portable
 MAXW = 11.8
 AUDIT = bool(os.environ.get('AUDIT'))
+
+# Voiceover-driven timing: if vo_timing.json exists (built by build_vo_timing.py
+# from the cleaned clips), each beat is held for the length of its spoken line
+# instead of the syllable estimate.
+VO_TIMING = None
+_vo_path = ROOT / 'vo_timing.json'
+if _vo_path.exists():
+    try:
+        VO_TIMING = json.loads(_vo_path.read_text()).get('scenes')
+    except Exception as e:  # noqa: BLE001
+        print(f'[vo] could not read {_vo_path}: {e}')
+
+# Optional per-beat animation speed factors (built from a timing pass) so each
+# beat's animation fits inside its line's audio window.
+VO_ANIM = None
+_va_path = ROOT / 'vo_anim.json'
+if _va_path.exists():
+    try:
+        VO_ANIM = json.loads(_va_path.read_text()).get('scenes')
+    except Exception as e:  # noqa: BLE001
+        print(f'[vo] could not read {_va_path}: {e}')
 
 
 def km(a, b):
@@ -186,17 +209,25 @@ class Film(Scene):
     SPS = 4.2     # syllables per second -> each block's hold (calm 3b1b pace)
     MIN_HOLD = 0.8
     END = 1.1     # hold on a scene's final frame
-    TAIL = 1.5    # seconds of empty background held after the end-of-scene fade
+    TAIL = 0.0    # no empty background after the end-of-scene fade (trimmed 1.5s)
+    VO_TAIL = 0.30  # silence kept after a line's voiceover before the next beat
+    _anim_scale = 1.0   # per-beat animation speed factor (set inside beat)
+    _in_fn = False      # True while a beat's animation runs
 
     def play(self, *animations, **kwargs):
         if 'run_time' in kwargs:
-            kwargs['run_time'] = kwargs['run_time'] * self.K
+            kwargs['run_time'] = kwargs['run_time'] * self.K * self._anim_scale
+        if VO_DEBUG and self._anim_scale != 1.0:
+            print(f'    [play] scale={self._anim_scale:.3f} rt={kwargs.get("run_time")} '
+                  f'n={len(animations)}')
         return super().play(*animations, **kwargs)
 
     def wait(self, duration=DEFAULT_WAIT_TIME, stop_condition=None, frozen_frame=None):
         # Manim freezes the frame during a plain wait and, in doing so, stops
         # ticking mobject updaters. That would freeze the mascot and every loop
         # token between beats, so force updaters to keep running during holds.
+        if self._in_fn:
+            duration = duration * self._anim_scale   # compress waits inside a beat's animation
         if AUDIT and duration >= 0.35:
             self._audit()
         return super().wait(duration, stop_condition=stop_condition, frozen_frame=False)
@@ -283,10 +314,12 @@ class Film(Scene):
     def construct(self):
         self._sub = None
         self._scene = '?'
+        self._vo_sched = []
         names = os.environ.get('SCENES', '').split(',') if os.environ.get('SCENES') else ORDER
         for name in names:
             self._sub = None
             self._scene = name
+            self._beat_i = 0
             self._hits = {}
             self.tail = self.TAIL
             self._speaker(CAST)
@@ -301,7 +334,11 @@ class Film(Scene):
             for m in self.mobjects:
                 m.clear_updaters()
             self.play(*[FadeOut(m) for m in self.mobjects], run_time=0.3)
-            self.wait(self.tail)
+            if self.tail > 1e-3:
+                self.wait(self.tail)
+        if os.environ.get('VO_SCHEDULE'):
+            Path(os.environ['VO_SCHEDULE']).write_text(json.dumps(self._vo_sched, indent=2))
+            print(f'[vo] schedule: {len(self._vo_sched)} beats -> {os.environ["VO_SCHEDULE"]}')
 
     # ── helpers ───────────────────────────────────────────────────────────────
     def _speaker(self, who):
@@ -330,12 +367,45 @@ class Film(Scene):
         self.wait(self.BEAT)
 
     def beat(self, text, fn=None, hold=None):
+        t0 = self.time
         self.sub(text)
+        t_sub = self.time
+        vo = None
+        if VO_TIMING is not None:
+            durs = VO_TIMING.get(self._scene, [])
+            if self._beat_i < len(durs):
+                vo = durs[self._beat_i]
+        scale = 1.0
+        if vo is not None and VO_ANIM is not None:
+            scales = VO_ANIM.get(self._scene, [])
+            if self._beat_i < len(scales):
+                scale = scales[self._beat_i]
+        self._beat_i += 1
+
+        if vo is None:                       # no voiceover -> syllable estimate
+            if fn is not None:
+                fn()
+            if hold is None:
+                hold = max(self.MIN_HOLD, syllables(text) / self.SPS)
+            self.wait(hold)
+            return
+
+        # Voiceover-driven beat: run the animation (optionally sped up so it
+        # fits the line), then hold so the whole beat lasts audio + VO_TAIL.
+        self._anim_scale = scale
+        self._in_fn = True
         if fn is not None:
             fn()
-        if hold is None:
-            hold = max(self.MIN_HOLD, syllables(text) / self.SPS)
-        self.wait(hold)
+        self._in_fn = False
+        self._anim_scale = 1.0
+        t_fn = self.time
+        self._vo_sched.append({'scene': self._scene, 'beat': self._beat_i,
+                               'start': round(t0, 4), 'audio': vo,
+                               'overhead': round(t_sub - t0, 4),
+                               'fn': round(t_fn - t_sub, 4)})
+        hold = vo + self.VO_TAIL - (t_fn - t0)
+        if hold > 1e-3:                  # skip a zero wait (manim forbids it)
+            self.wait(hold)
 
     def title(self, text):
         self.play(Write(label(text, 30, INK).to_corner(UL, buff=0.5)), run_time=0.6)
@@ -365,11 +435,24 @@ class Film(Scene):
             # name on the bar's left edge, value in its own column: numbers compare,
             # which is the whole point of a chart. Beats padding names with spaces.
             nl, vl = label(text, 20, color), label(val, 20, color)
-            nl.move_to([x0 + nl.width / 2, y + 0.26, 0])
-            vl.move_to([x0 + 3.4 + vl.width / 2, y + 0.26, 0])
+            nl.move_to([x0 + nl.width / 2, y + 0.36, 0])
+            vl.move_to([x0 + 2.8 + vl.width / 2, y + 0.36, 0])
             t = VGroup(nl, vl)
         self.play(GrowFromEdge(b, LEFT), FadeIn(t), run_time=rt)
         return b, t
+
+    def dim_code(self, code, keep, dim=0.22):
+        """Dim every code line except those in `keep` (0-based line indices).
+
+        Used instead of boxing lines: the relevant code stays bright, the rest
+        fades into the background so the eye follows the discussion.
+        """
+        keep = set(keep)
+        self.play(*[ln.animate.set_opacity(1.0 if i in keep else dim)
+                    for i, ln in enumerate(code.code_lines)], run_time=0.4)
+
+    def brighten_code(self, code, rt=0.3):
+        self.play(*[ln.animate.set_opacity(1.0) for ln in code.code_lines], run_time=rt)
 
     def token(self, points, color, speed=1.6, r=0.1):
         """A dot that loops forever along a polyline — keeps a beat's diagram alive.
@@ -382,9 +465,10 @@ class Film(Scene):
         lens = [np.linalg.norm(b - a) for a, b in segs]
         tot = sum(lens)
         d = Dot(pts[0], radius=r, color=color).set_z_index(7)
+        t_start = self.time          # start at pts[0], not wherever global time puts it
 
         def upd(m):
-            x = (self.time * speed) % tot
+            x = ((self.time - t_start) * speed) % tot
             for (a, b), ln in zip(segs, lens):
                 if x <= ln:
                     m.move_to(a + (b - a) * (x / ln))
@@ -404,7 +488,7 @@ class Film(Scene):
             box['d'] = self.diagram(width=9.36, center=LEFT * 2.0 + UP * 0.2)
             # the map draws single initials, so name the two cities that matter
             names = VGroup(label('Arad', 20, GREEN).next_to(box['d'].nodes['Arad'], LEFT, buff=0.15),
-                           label('Bucharest', 20, RED).next_to(box['d'].nodes['Bucharest'], DOWN, buff=0.15))
+                           label('Bucharest', 20, RED).next_to(box['d'].nodes['Bucharest'], UP, buff=0.8))
             self.play(FadeIn(names, shift=UP * 0.08),
                       Indicate(box['d'].nodes['Arad'], color=GREEN),
                       Indicate(box['d'].nodes['Bucharest'], color=RED), run_time=0.6)
@@ -483,7 +567,8 @@ class Film(Scene):
     def sc_ucsproof(self):
         self.title('Why cheapest-first works')
         S = 1.3     # diagram scale: the scene runs without a character
-        pts = [p * S for p in (LEFT * 4.5 + UP * 0.4, LEFT * 0.1 + UP * 0.4, RIGHT * 4.5 + UP * 0.4)]
+        # goal sits above the midpoint of start-frontier, so the triangle is isoceles
+        pts = [p * S for p in (LEFT * 4.5 + UP * 0.4, LEFT * 0.1 + UP * 0.4, LEFT * 2.3 + UP * 2.0)]
         for p, t in zip(pts, ['start', 'frontier', 'goal']):
             self.add(Dot(p, radius=0.1 * S, color=PURPLE),
                      label(t, round(20 * S), MUTED).next_to(p, DOWN, buff=0.25 * S))
@@ -619,7 +704,7 @@ class Film(Scene):
 
         chord = DashedLine(a, b, color=GOLD, stroke_width=3).set_z_index(2)
         self.beat("Their vector sum spans the start-to-goal gap.",
-                  lambda: (self.play(Create(chord), run_time=0.6),
+                  lambda: (self.play(FadeIn(chord), run_time=0.6),
                            self.add(label('the gap', 20, GOLD).move_to((a + b) / 2 + normal * 0.95))))
 
         read = label('real route   140+80+97+101 = 418', 20, INK).set_z_index(6).move_to(DOWN * 2.45)
@@ -637,28 +722,31 @@ class Film(Scene):
 
     def sc_triangle(self):
         self.title('Why subtract landmark distances')
-        L = LEFT * 2.8 + UP * 1.3
-        n = LEFT * 3.6 + DOWN * 1.2
-        t = RIGHT * 3.4 + DOWN * 1.2
-        # same colour coding as sc_landmark, which draws the same three points
-        for p, name, d, c in [(L, 'L', UP, GOLD), (n, 'n', DOWN, CYAN), (t, 't', UP, GREEN)]:
-            self.add(Dot(p, color=MUTED), label(name, 24, c).next_to(p, d, buff=0.15))
+        L = LEFT * 2.9 + UP * 1.5          # Landmark
+        n = LEFT * 3.9 + DOWN * 1.1        # node (its h we are estimating)
+        t = RIGHT * 3.3 + DOWN * 1.1       # target (goal)
+        for p, name, d, c in [(L, 'Landmark', UP, GOLD), (n, 'node', DOWN, CYAN),
+                              (t, 'target', RIGHT, GREEN)]:
+            self.add(Dot(p, color=MUTED), label(name, 20, c).next_to(p, d, buff=0.16))
+
+        def edge(a, b, color, tag_text, tag_pos):
+            self.play(Create(Line(a, b, color=color, stroke_width=5)), run_time=0.5)
+            self.add(tag(tag_text, 17, color).move_to(tag_pos))
+
         self.beat("Why use the difference in distances?",
-                  lambda: (self.play(Create(Line(L, t, color=GREEN, stroke_width=5)), run_time=0.5),
-                           self.add(self.token([L, t], GOLD)),
-                           self.add(tag('d(L,t)', 20, GREEN).move_to((L + t) / 2 + UP * 0.35))))
+                  lambda: (edge(L, t, GREEN, 'd(Landmark,target)', (L + t) / 2 + UP * 0.4),
+                           self.add(self.token([L, t], GOLD))))
         self.beat("Going via t cannot shorten the shortest path.",
-                  lambda: (self.play(Create(Line(L, n, color=CYAN, stroke_width=5)), run_time=0.5),
-                           self.add(tag('d(L,n)', 20, CYAN).move_to((L + n) / 2 + LEFT * 0.7))))
-        self.beat("Thus d(L,n) ≤ d(L,t) + d(t,n).",
-                  lambda: (self.play(Create(Line(n, t, color=RED, stroke_width=5)), run_time=0.5),
-                           self.add(self.token([L, n, t], GOLD)),
-                           self.add(tag('d(n,t)', 20, RED).move_to((n + t) / 2 + UP * 0.30))))
-        self.beat("Swap n and t, then rearrange both inequalities.", lambda: self.add(
-            VGroup(label('|', 28, INK), label('d(L,n)', 28, CYAN), label('  −  ', 28, INK),
-                   label('d(L,t)', 28, GREEN), label('|   ≤   ', 28, INK),
-                   label('d(n,t)', 28, RED)).arrange(RIGHT, buff=0.06).move_to([0, -1.7, 0])))
-        self.beat("So |d(L,n) − d(L,t)| ≤ d(n,t).")
+                  lambda: edge(L, n, CYAN, 'd(Landmark,node)', (L + n) / 2 + LEFT * 0.95))
+        self.beat("Thus L-to-n is at most L-to-t plus t-to-n.",
+                  lambda: (edge(n, t, RED, 'd(node,target)', (n + t) / 2 + DOWN * 0.42),
+                           self.add(self.token([L, n, t], GOLD))))
+        self.beat("Swap n and t, then rearrange both inequalities.", lambda: self.play(
+            FadeIn(VGroup(label('|', 26, INK), label('d(L,n)', 22, CYAN), label(' − ', 26, INK),
+                          label('d(L,t)', 22, GREEN), label('| ≤', 26, INK),
+                          label('d(n,t)', 22, RED)).arrange(RIGHT, buff=0.07).move_to([0, -1.9, 0])),
+            run_time=0.4))
+        self.beat("So their difference is at most n-to-t.")
 
     def sc_landmark(self):
         self.title('One landmark, one triangle')
@@ -688,7 +776,7 @@ class Film(Scene):
         lt = tag('d(L,t)', 20, GREEN).move_to((L + t) / 2 + DOWN * 0.45)
 
         def arms():
-            self.play(Create(arm_n), Create(arm_t), run_time=0.6)
+            self.play(FadeIn(arm_n), FadeIn(arm_t), run_time=0.6)
             self.play(FadeIn(ln), FadeIn(lt), run_time=0.3)
         self.beat("Its arms measure distances to n and t.", arms)
 
@@ -703,18 +791,18 @@ class Film(Scene):
         over = Line(n, arm_t.get_end(), color=RED, stroke_width=10).set_z_index(6)
 
         def leftover():
-            self.play(Create(over), run_time=0.4)
+            self.play(FadeIn(over), run_time=0.4)
             self.add(tag('the leftover', 20, RED).move_to(over.get_center() + RIGHT * 0.6 + DOWN * 0.66))
         self.beat("The red remainder is their length difference.", leftover)
 
         def compare():
-            self.play(Create(Line(n, t, color=RED, stroke_width=5)), run_time=0.4)
+            self.play(FadeIn(Line(n, t, color=RED, stroke_width=5)), run_time=0.4)
             self.add(tag('d(n,t)', 20, RED).move_to((n + t) / 2 + DOWN * 0.4))
             x0, y1, y2 = 0.6, -1.45, -2.15
             ol, nl = over.get_length(), float(np.linalg.norm(t - n))
             ob = Line([x0, y1, 0], [x0 + ol, y1, 0], color=RED, stroke_width=9).set_z_index(6)
             nb = Line([x0, y2, 0], [x0 + nl, y2, 0], color=RED, stroke_width=6).set_z_index(6)
-            self.play(Create(ob), Create(nb), run_time=0.5)
+            self.play(FadeIn(ob), FadeIn(nb), run_time=0.5)
             self.add(label('leftover', 18, RED).next_to(ob, UP, buff=0.08).align_to(ob, LEFT),
                      label('d(n,t)', 18, RED).next_to(nb, DOWN, buff=0.08).align_to(nb, LEFT),
                      VGroup(label('|', 24, INK), label('d(L,n)', 24, CYAN), label(' − ', 24, INK),
@@ -783,8 +871,8 @@ class Film(Scene):
             return n
 
         def race():
-            self.add(label('uniform cost', 24, PURPLE).next_to(left, UP, buff=0.1),
-                     label('A*  (guided)', 24, GREEN).next_to(right, UP, buff=0.1))
+            self.add(label('UCS', 24, PURPLE).next_to(left, UP, buff=0.1),
+                     label('A*', 24, GREEN).next_to(right, UP, buff=0.1))
             # one count over each map, not a scoreboard stranded between them
             st['sL'] = self.counter('explored', PURPLE, LEFT * 4.1 + UP * 2.75)
             st['sR'] = self.counter('explored', GREEN, RIGHT * 4.1 + UP * 2.75)
@@ -800,13 +888,29 @@ class Film(Scene):
     def sc_cutwork(self):
         self.title('Does it cut the work?')
         # same anchor rule as sc_max / sc_tightness / sc_guarantee: widest bar straddles 0
-        scale, x0 = 6.0 / 11, -3.0
-        self.beat("These averages cover all 380 pairs.", lambda: self.bar(11, 1.0, PURPLE, 'uniform cost   11', scale, x0))
-        self.beat("Average work falls from 11 to 5.", lambda: self.bar(5, 0.1, GREEN, 'A* (guided)   5', scale, x0))
+        scale, x0, span = 6.0 / 11, -3.0, 6.0
+
+        def frame():
+            # x axis (nodes explored) + faint grid, so the bars read as a chart
+            self.play(Create(Line([x0, -1.4, 0], [x0 + span, -1.4, 0], color=INK, stroke_width=3)),
+                      *[Create(Line([x0 + k * scale, -1.4, 0], [x0 + k * scale, 1.7, 0],
+                                    color=MUTED, stroke_width=1).set_opacity(0.35))
+                        for k in range(0, 12)],
+                      run_time=0.7)
+            self.add(*[Line([x0 + k * scale, -1.3, 0], [x0 + k * scale, -1.5, 0],
+                            color=MUTED, stroke_width=2) for k in (0, 5, 10)],
+                     label('nodes explored', 20, MUTED).move_to([x0 + span / 2, -1.8, 0]),
+                     label('lower is better', 20, GREEN).move_to([x0 + span - 0.7, 1.6, 0]))
+        self.beat("These averages cover all 380 pairs.",
+                  lambda: (frame(), self.bar(11, 1.0, PURPLE, 'uniform cost   11', scale, x0)))
+        self.beat("Average work falls from 11 to 5.",
+                  lambda: (self.bar(5, 0.1, GREEN, 'A* (guided)   5', scale, x0),
+                           self.play(GrowArrow(Arrow([x0 + 11 * scale, 1.0, 0], [x0 + 5 * scale, 0.1, 0],
+                                                     buff=0.12, color=WHITE, stroke_width=4)), run_time=0.5)))
         self.beat("Greedy is quicker, but wrong on 61 pairs.",
                   lambda: self.bar(5, -0.8, RED, 'greedy   5   wrong on 61', scale, x0))
         self.beat("UCS and A* remain optimal on all pairs.",
-                  lambda: self.play(FadeIn(label('all optimal on 380 pairs', 24, GREEN).move_to(DOWN * 1.9)), run_time=0.4))
+                  lambda: self.play(FadeIn(label('all optimal on 380 pairs', 24, GREEN).move_to(DOWN * 2.2)), run_time=0.4))
 
     def sc_complexity(self):
         self.title('Time and space')
@@ -843,18 +947,21 @@ class Film(Scene):
         def stat(cx, y, name, color):
             # name and value anchored to fixed columns so the two rows line up
             return VGroup(label(name, 20, color).move_to([cx - 1.0, y, 0]),
-                          label('O(b^d)', 20, color).move_to([cx + 0.75, y, 0]))
+                          label('𝕆(bᵈ)', 20, color).move_to([cx + 0.75, y, 0]))
         timeL, spaceL = stat(CL, -1.35, 'time', PURPLE), stat(CL, -1.85, 'space', PURPLE)
         timeR, spaceR = stat(CR, -1.35, 'time', GREEN), stat(CR, -1.85, 'space', GREEN)
 
         def start():
             self.play(FadeIn(label('blind search', 22, PURPLE).move_to([CL, 2.6, 0])),
                       FadeIn(label('A*  (heuristic)', 22, GREEN).move_to([CR, 2.6, 0])), run_time=0.4)
-            self.play(FadeIn(node(L['root'], PURPLE)), run_time=0.2)
+            self.play(FadeIn(node(L['root'], PURPLE)), FadeIn(node(R['root'], MUTED)), run_time=0.2)
+            # draw both graphs together: the same space, blind on the left, A* greyed on the right
             for i in (1, 2, 3):
                 self.play(LaggedStart(*[Create(road(a, b)) for a, b in level_edges(L, i)],
                                       *[FadeIn(node(p, PURPLE)) for p in level_nodes(L, i)],
-                                      lag_ratio=0.1), run_time=0.55)
+                                      *[Create(road(a, b, MUTED, 1.8)) for a, b in level_edges(R, i)],
+                                      *[FadeIn(node(p, MUTED)) for p in level_nodes(R, i)],
+                                      lag_ratio=0.08), run_time=0.7)
         self.beat("Unguided search fills all 15 nodes here.", start)
 
         self.beat("Worst-case time and space are both O(b^d).",
@@ -870,7 +977,7 @@ class Film(Scene):
                       run_time=0.3)
             self.play(Create(road(R['root'], R['l1'][1], GOLD, 3.0)),
                       FadeIn(node(R['l1'][1], GOLD)),
-                      FadeIn(tag('pruned', 16, GOLD).next_to(R['l1'][1], UP, buff=0.14)), run_time=0.35)
+                      FadeIn(tag('pruned', 16, GOLD).next_to(R['l1'][1], RIGHT, buff=0.12)), run_time=0.35)
             self.add(self.token([R['root'], R['l1'][0], R['l2'][0], R['l3'][0]], GREEN, speed=1.2))
         self.beat("A*'s estimate focuses this search on 5 nodes.", narrow)
 
@@ -894,7 +1001,8 @@ class Film(Scene):
                   lambda: self.bar(418, 1.2, GOLD, 'frontier  ≤', 6.0 / 450, x0=-3.0, val='418'))
         self.beat("It must come first, a contradiction.",
                   lambda: self.add(VGroup(label('contradiction', 24, RED),
-                                          label('→  optimal', 24, GREEN)).arrange(RIGHT, buff=0.20).move_to(DOWN * 2.0)))
+                                          Arrow(LEFT * 0.35, RIGHT * 0.35, buff=0, color=INK, stroke_width=5),
+                                          label('optimal', 24, GREEN)).arrange(RIGHT, buff=0.24).move_to(DOWN * 2.0)))
 
     def sc_bothends(self):
         self.title('Search from both ends')
@@ -964,15 +1072,14 @@ class Film(Scene):
                   lambda: self.play(FadeIn(arad), run_time=0.4))
 
         def take():
-            b = hl_lines(code, 1, 2)
-            self.play(Create(b), run_time=0.35)
-            self.wait(0.9)          # let the highlight linger before it clears
-            self.play(FadeOut(arad), FadeOut(b), run_time=0.3)
+            self.dim_code(code, range(1, 3))
+            self.wait(0.9)          # let the focus linger before it clears
+            self.play(FadeOut(arad), run_time=0.3)
+            self.brighten_code(code)
         self.beat("Sort by cost and remove the first entry.", take)
 
         def relax():
-            b = hl_lines(code, 6, 9, GOLD)
-            self.play(Create(b), run_time=0.4)
+            self.dim_code(code, range(6, 10))
             sib = card('Sibiu   140', GREEN, w=2.9, size=16).move_to(fx + UP * 1.0)
             tim = card('Timisoara   118', GREEN, w=2.9, size=16).move_to(fx + UP * 0.44)
             zer = card('Zerind   75', GREEN, w=2.9, size=16).move_to(fx + DOWN * 0.12)
@@ -980,7 +1087,7 @@ class Film(Scene):
             self.wait(0.2)
             self.play(zer.animate.move_to(fx + UP * 1.0), sib.animate.move_to(fx + DOWN * 0.12),
                       run_time=0.5)
-            self.play(FadeOut(b), run_time=0.2)
+            self.brighten_code(code)
         self.beat("Update neighbours when a cheaper route appears.", relax)
         self.beat("The lowest-cost route stays at the front.")
 
@@ -989,46 +1096,45 @@ class Film(Scene):
         code = code_panel(ASTAR_SRC).move_to(LEFT * 2.90 + UP * 0.45)
         self.play(FadeIn(code), run_time=0.5)
         fx = RIGHT * 4.75
-        self.add(VGroup(label('f', 26, GREEN), label(' = ', 26, INK), label('g', 26, PURPLE),
-                        label(' + ', 26, INK), label('h', 26, GOLD)).arrange(RIGHT, buff=0.06)
-                 .move_to(fx + UP * 2.95),
+        eq = VGroup(label('f', 26, GREEN), label(' = ', 26, INK), label('g', 26, PURPLE),
+                    label(' + ', 26, INK), label('h', 26, GOLD)).arrange(RIGHT, buff=0.06)
+        eq[2].shift(DOWN * 0.10)   # 'g' has a descender: nudge down so it sits on the baseline
+        self.add(eq.move_to(fx + UP * 2.95),
                  label('frontier   g → f', 20, MUTED).move_to(fx + UP * 2.45))
 
         sib = card('Sibiu   140 → 418', GREEN, w=2.9, size=16).move_to(fx + UP * 1.65)
         zer = card('Zerind   75 → 568', GOLD, w=2.9, size=16).move_to(fx + UP * 1.02)
-        tim = card('Timisoara   118 → 654', MUTED, w=2.9, size=16).move_to(fx + UP * 0.39)
+        tim = card('Timisoara   118 → 654', MUTED, w=2.9, size=16).move_to(fx + UP * 1.02)
         self.beat("Sibiu's cost 140 becomes an f of 418.",
                   lambda: self.play(FadeIn(sib), run_time=0.4))
 
         def smallest():
-            b = hl_lines(code, 1, 3)
-            c = hl_lines(code, 5, 5, CYAN)
-            self.play(Create(b), Create(c), run_time=0.4)
+            self.dim_code(code, [1, 2, 3, 5])
             self.play(Indicate(sib, color=GREEN, scale_factor=1.08), run_time=0.5)
-            self.play(FadeOut(b), FadeOut(c), run_time=0.2)
+            self.brighten_code(code)
         self.beat("Each turn takes the entry with smallest f.", smallest)
 
         def nearer():
-            self.play(FadeIn(zer, shift=UP * 0.1), FadeIn(tim, shift=UP * 0.1), run_time=0.35)
+            # only Zerind enters here; Timisoara waits for its own line (below)
+            self.play(FadeIn(zer, shift=UP * 0.1), run_time=0.35)
             self.play(Indicate(zer, color=GOLD), run_time=0.5)
         self.beat("Zerind costs only 75, but its f is 568.", nearer)
 
         def stale():
-            b = hl_lines(code, 7, 7, RED)
-            old = card('Zerind   568', MUTED, w=2.9, size=16).move_to(fx + DOWN * 0.26)
-            cross = Line(old.get_corner(DL) + RIGHT * 0.1, old.get_corner(UR) + LEFT * 0.1,
+            # strike the stale frontier entry, then remove it
+            self.dim_code(code, [7])
+            cross = Line(zer.get_corner(DL) + RIGHT * 0.1, zer.get_corner(UR) + LEFT * 0.1,
                          color=RED, stroke_width=3)
-            self.play(Create(b), FadeIn(old), Create(cross), run_time=0.4)
-            self.play(FadeOut(b), FadeOut(old), FadeOut(cross), run_time=0.3)
+            self.play(Create(cross), run_time=0.4)
+            self.play(FadeOut(cross), FadeOut(zer), run_time=0.3)
+            self.brighten_code(code)
         self.beat("Discard stale entries with higher costs.", stale)
 
-        def push():
-            b = hl_lines(code, 10, 11, GOLD)
-            new = card('Rimnicu V.   220 → 418', GREEN, w=2.9, size=16).move_to(fx + DOWN * 0.22)
-            self.play(Create(b), run_time=0.35)
-            self.play(FadeIn(new, shift=UP * 0.1), run_time=0.3)
-            self.play(FadeOut(b), run_time=0.2)
-        self.beat("The pushed copy of Rimnicu V. carries f 418.", push)
+        def tim_entry():
+            self.dim_code(code, range(10, 12))
+            self.play(FadeIn(tim, shift=UP * 0.1), run_time=0.3)
+            self.brighten_code(code)
+        self.beat("Timisoara enters at cost 118, with f 654.", tim_entry)
 
     def sc_code_bounds(self):
         self.title('Where the guess comes from')
@@ -1041,26 +1147,27 @@ class Film(Scene):
 
         def two():
             self.play(FadeIn(lp), FadeIn(alt), run_time=0.4)
-            self.play(GrowArrow(Arrow(lp.get_bottom(), best.get_corner(UL) + LEFT * 0.2, buff=0.08,
+            # both bounds feed the max: purple (left) points right, gold (right) points left
+            self.play(GrowArrow(Arrow(lp.get_bottom(), best.get_top() + LEFT * 0.5, buff=0.08,
                                       color=PURPLE, stroke_width=4)),
-                      GrowArrow(Arrow(alt.get_bottom(), best.get_corner(UR) + RIGHT * 0.2, buff=0.08,
+                      GrowArrow(Arrow(alt.get_bottom(), best.get_top() + RIGHT * 0.5, buff=0.08,
                                       color=GOLD, stroke_width=4)), run_time=0.5)
             self.play(FadeIn(best), run_time=0.4)
         self.beat("The estimate takes the maximum of two bounds.", two)
 
         def read_table():
-            b = hl_lines(code, 1, 1)
-            self.play(Create(b), Indicate(lp, color=PURPLE), run_time=0.6)
-            self.play(FadeOut(b), run_time=0.2)
+            self.dim_code(code, [1])
+            self.play(Indicate(lp, color=PURPLE), run_time=0.6)
+            self.brighten_code(code)
         self.beat("The offline LP table supplies 388.", read_table)
 
         def landmarks():
-            b = hl_lines(code, 4, 6, CYAN)
-            self.play(Create(b), Indicate(alt, color=GOLD), run_time=0.6)
-            self.play(FadeOut(b), run_time=0.2)
+            self.dim_code(code, range(4, 7))
+            self.play(Indicate(alt, color=GOLD), run_time=0.6)
+            self.brighten_code(code)
         self.beat("Landmark distances supply 418.", landmarks)
         self.beat("Taking 418 preserves the lower-bound guarantee.",
-                  lambda: self.play(Create(hl_lines(code, 9, 9, GREEN)), run_time=0.5))
+                  lambda: self.dim_code(code, [9]))
 
     def sc_code_table(self):
         self.title('The table is built once')
@@ -1080,19 +1187,19 @@ class Film(Scene):
         self.beat("Precompute the LP bounds before searching.", pipe)
 
         def arrows():
-            b = hl_lines(code, 1, 3)
-            self.play(Create(b), Indicate(boxes[1], color=CYAN), run_time=0.6)
-            self.play(FadeOut(b), run_time=0.2)
+            self.dim_code(code, range(1, 4))
+            self.play(Indicate(boxes[1], color=CYAN), run_time=0.6)
+            self.brighten_code(code)
         self.beat("Encode the map as 46 weighted arrows.", arrows)
 
         def solve():
-            b = hl_lines(code, 4, 6)
-            self.play(Create(b), Indicate(boxes[2], color=PURPLE), run_time=0.6)
-            self.play(FadeOut(b), run_time=0.2)
+            self.dim_code(code, range(4, 7))
+            self.play(Indicate(boxes[2], color=PURPLE), run_time=0.6)
+            self.brighten_code(code)
         self.beat("Minimise the cost of a fractional mixture.", solve)
         self.beat("Store results such as 388 in the table.",
-                  lambda: self.play(Create(hl_lines(code, 9, 9, GREEN)),
-                                    Indicate(boxes[3], color=GREEN), run_time=0.7))
+                  lambda: (self.dim_code(code, [9]),
+                           self.play(Indicate(boxes[3], color=GREEN), run_time=0.7)))
 
     def sc_code_both(self):
         self.title('Two fronts, one answer')
@@ -1112,35 +1219,42 @@ class Film(Scene):
         self.beat("Maintain a search from each endpoint.", two)
 
         def combine():
-            b = hl_lines(code, 1, 1)
-            self.play(Create(b), run_time=0.4)
-            self.play(GrowArrow(Arrow(lc[1].get_bottom(), badge.get_corner(UL) + LEFT * 0.2, buff=0.1,
+            self.dim_code(code, [1])
+            self.play(GrowArrow(Arrow(lc[1].get_bottom(), badge.get_top() + LEFT * 0.5, buff=0.1,
                                       color=CYAN, stroke_width=4)),
-                      GrowArrow(Arrow(rc[1].get_bottom(), badge.get_corner(UR) + RIGHT * 0.2, buff=0.1,
+                      GrowArrow(Arrow(rc[1].get_bottom(), badge.get_top() + RIGHT * 0.5, buff=0.1,
                                       color=GOLD, stroke_width=4)), run_time=0.5)
-            self.play(FadeOut(b), run_time=0.2)
+            self.brighten_code(code)
         self.beat("Each front bounds the whole trip.", combine)
 
         def halt():
-            b = hl_lines(code, 5, 6, GREEN)
-            self.play(Create(b), run_time=0.4)
+            self.dim_code(code, range(5, 7))
             self.play(FadeIn(badge, shift=UP * 0.08), run_time=0.4)
-            self.play(FadeOut(b), run_time=0.2)
+            self.brighten_code(code)
         self.beat("Stop when a bound meets the best route.", halt)
 
     def sc_recap(self):
         self.title('What we gained')
-        self.beat("Cost alone takes 13 expansions here.", lambda: self.play(
-            FadeIn(label('explore by cost', 30, PURPLE).move_to(UP * 1.2)), run_time=0.4))
-        self.beat("A lower-bound estimate guides the search.", lambda: self.play(
-            FadeIn(label('guide with a safe estimate', 30, GOLD).move_to(UP * 0.3)), run_time=0.4))
-        self.beat("Search both ends, then certify when to stop.", lambda: (
-            self.play(FadeIn(label('combine two bounds', 30, GREEN).move_to(DOWN * 0.6)), run_time=0.4),
-            self.play(FadeIn(label('search both ends', 30, CYAN).move_to(DOWN * 1.5)), run_time=0.4)))
-        def counts():
-            # close on the film's own numeric device: the two searches counting up
-            a = self.counter('expansions, cost alone', PURPLE, LEFT * 2.9 + DOWN * 2.6, size=44)
-            b = self.counter('expansions, guided', GREEN, RIGHT * 2.9 + DOWN * 2.6, size=44)
-            self.add(label('same 418 km route', 22, INK).move_to(DOWN * 2.6))
-            self.play(a.animate.set_value(13), b.animate.set_value(5), run_time=1.2)
-        self.beat("Five expansions, on the same 418 km route.", counts)
+        # a left-to-right flow: how the film's ideas build to the same answer, less work
+        y, xs = 0.0, [-5.05, -1.68, 1.68, 5.05]
+        steps = [
+            ('explore by cost', PURPLE, 'extend the cheapest\nroute found so far'),
+            ('guide with estimate', GOLD, 'rank by cost with\nestimate heuristic.'),
+            ('search both ends', CYAN, 'search from each end\nuntil they meet.'),
+            ('same route, less work', GREEN, 'same shortest route,\nfewer cities expanded'),
+        ]
+        cards = [card(t, c, w=2.85, h=0.8, size=17).move_to([x, y, 0])
+                 for (t, c, _), x in zip(steps, xs)]
+        caps = [label(d, 15, MUTED).move_to([x, y - 1.02, 0])
+                for (_, _, d), x in zip(steps, xs)]
+        arrows = [Arrow([xs[i] + 1.43, y, 0], [xs[i + 1] - 1.43, y, 0], buff=0.04,
+                        color=INK, stroke_width=4) for i in range(3)]
+
+        self.beat("Cost alone takes 13 expansions here.",
+                  lambda: self.play(FadeIn(cards[0]), FadeIn(caps[0]), run_time=0.5))
+        self.beat("A lower-bound estimate guides the search.",
+                  lambda: self.play(FadeIn(arrows[0]), FadeIn(cards[1]), FadeIn(caps[1]), run_time=0.5))
+        self.beat("Search both ends, then certify when to stop.",
+                  lambda: self.play(FadeIn(arrows[1]), FadeIn(cards[2]), FadeIn(caps[2]),
+                                    FadeIn(arrows[2]), FadeIn(cards[3]), FadeIn(caps[3]), run_time=0.7))
+        self.beat("Five expansions, on the same 418 km route.")

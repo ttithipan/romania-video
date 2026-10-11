@@ -19,7 +19,12 @@ each subtitle is paired with the graphic that is on screen in the same beat.
 | `manim.cfg` | Manim CLI defaults (1080p, media dir) |
 | `project_data.json` | Graph, distances and exported algorithm traces the film draws |
 | `render.sh` | Renders the whole film, or one file per scene, into `output/` |
-| `output/` | **Rendered results (tracked in git):** `Film.mp4`, one `scene_NN_<scene>.mp4` per scene, and `gifs/` |
+| `render_vo.sh` | Renders the voiceover-muxed versions into `output/film_vo/` and `output/scenes_vo/` |
+| `build_vo_timing.py` | Builds `vo_timing.json` (per-beat spoken durations) from `audio/blocks/clean` |
+| `fit_vo_anim.py` | Builds `vo_anim.json` (per-beat animation speed-up factors) with a two-pass fit |
+| `build_vo_track.py` | Assembles a voiceover track from the clips + a beat schedule (`VO_SCHEDULE`) |
+| `audio/` | Voiceover: `VO-AI_draft.mp3` + `raw/` (uncleaned per-block clips, `manifest.json`) + `clean/` (denoised + trimmed) |
+| `output/` | **Rendered results (tracked in git):** silent `film/`, `scenes/`, `gifs/`; voiced `film_vo/`, `scenes_vo/` |
 | `render_gifs.sh` | Renders the seven guide GIFs into `output/gifs/` (`PUBLISH=1` copies them into the site) |
 | `requirements.txt` | Runtime dependencies |
 
@@ -30,7 +35,8 @@ each subtitle is paired with the graphic that is on screen in the same beat.
 
 ## Render
 
-Finished mp4s are written to **`output/`**, which is committed so a fresh clone
+Finished mp4s are written to **`output/`** (silent in `film/` and `scenes/`,
+voiced in `film_vo/` and `scenes_vo/`), which is committed so a fresh clone
 already has the renders and does not need to rebuild. Intermediates and partial
 frame files stay in the gitignored `media/`.
 
@@ -38,18 +44,50 @@ frame files stay in the gitignored `media/`.
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 
-./render.sh                 # whole film        -> output/Film.mp4
-./render.sh scenes          # one file per scene -> output/scene_01_sc_route.mp4 ...
+./render.sh                 # whole film        -> output/film_silent/Film.mp4
+./render.sh scenes          # one file per scene -> output/scene_silent/scene_01_sc_route.mp4 ...
 ./render.sh sc_race sc_stop # a few scenes only
 
 QUALITY=-ql ./render.sh     # fast 480p15 pass
 OUT=/tmp/preview ./render.sh sc_route   # write somewhere else
 ```
 
+Silent and voiced renders are kept side by side:
+
+| Folder | Contents |
+|--------|----------|
+| `output/film_silent/` | silent whole film — `Film.mp4` |
+| `output/scene_silent/` | silent per-scene — `scene_NN_<scene>.mp4` |
+| `output/film_vo/` | voiced whole film — `Film.mp4` |
+| `output/scenes_vo/` | voiced per-scene — `scene_NN_<scene>_vo.mp4` |
+| `output/gifs/` | guide GIFs |
+| `output/samples/` | scratch review frames/clips (gitignored) |
+
 Per-scene files are `scene_NN_<scene>.mp4`, where `NN` is the scene's 1-based
 position in `film.ORDER` (so they sort in playback order). The `<scene>` part is
 the scene method, e.g. `scene_01_sc_route.mp4`, `scene_11_sc_lpproof.mp4`,
 `scene_14_sc_code_astar.mp4`, `scene_22_sc_recap.mp4`.
+
+## Voiceover render
+
+The voiced film needs the per-beat timing (`vo_timing.json`) and the animation
+speed-up fit (`vo_anim.json`), both derived from the cleaned clips in
+`audio/clean`:
+
+```sh
+.venv/bin/python build_vo_timing.py            # spoken durations -> vo_timing.json
+# refresh the fit (two-pass) whenever the visuals change:
+VO_SCHEDULE=media/_fit/p1.json .venv/bin/python -m manim -ql film.py Film
+.venv/bin/python fit_vo_anim.py media/_fit/p1.json
+VO_SCHEDULE=media/_fit/p2.json .venv/bin/python -m manim -ql film.py Film
+.venv/bin/python fit_vo_anim.py media/_fit/p1.json media/_fit/p2.json
+
+./render_vo.sh              # whole film + every scene -> output/film_vo, output/scenes_vo
+./render_vo.sh film         # whole film only
+./render_vo.sh scenes       # every scene
+./render_vo.sh sc_race      # named scenes only
+QUALITY=-ql ./render_vo.sh sc_recap   # fast preview
+```
 
 ## Reviewing a scene
 

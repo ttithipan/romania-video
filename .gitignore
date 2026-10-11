@@ -4,3 +4,5 @@ media/
 .claude
 .serena
 .mcp.json
+audio/
+output/samples/
