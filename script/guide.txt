@@ -1,0 +1,86 @@
+MODERN UI: RUN A SEARCH (0:00)
+0:00  Romania Pathfinding Visualizer: 9 search algorithms, two lanes, one map.
+0:06  Heuristics use only the graph data from the assignment. No straight-line distance, no GPS.
+0:13  Pick a start and a goal city.
+0:16  Choose an algorithm for each lane: UCS in A, A* (LP+ALT) in B.
+0:22  Slide the speed toward Fast, then press Play.
+0:26  Purple: current · Orange: frontier · Grey: visited · Green: final path.
+0:32  Step back or forward one expansion at a time.
+
+COMPARE (0:34)
+0:36  Both lanes find the optimal 418 km route, but A* generates fewer nodes.
+0:42  Swap lane A to DFS: it still finds a path, but it costs 450 km.
+
+MAP TOOLS (0:44)
+0:48  Heatmap: the redder the city, the lower its h, the closer to the goal.
+0:54  ALT is built from landmarks. Pick 2, 4 or 8 per lane…
+0:59  …or open the landmark picker and click cities to place your own.
+1:04  Merged map: one map, a purple strand for lane A and a teal strand for lane B.
+1:11  Straight Line is a visual reference only. The heuristic never uses it.
+
+MORE ALGORITHMS (1:13)
+1:17  Bidirectional A* searches from both ends and meets in the middle.
+1:22  BFS finds the fewest hops, not the fewest kilometres.
+
+GUIDE & THEMES (1:25)
+1:27  The Guide tab walks from UCS to A* and the heuristic, with measured results.
+1:33  Pick a theme: Light, Dark, Space or Dungeons & Dragons.
+
+GAME UI: MOVE THE MAP (1:47)
+1:47  Now the game UI: same engine, pixel-art map.
+1:51  Route and algorithms on top, tools below, then the map beside the stats.
+1:57  Scroll the mouse wheel to zoom in toward the cursor.
+2:02  Drag to pan around the map.
+2:05  On a trackpad, pinch to zoom in finer steps.
+2:09  The readout shows position and scale. RESET puts the view back.
+
+GAME UI: DROPDOWNS (2:11)
+2:15  Dropdowns open on click. Type a letter to jump to a city.
+2:20  The dice rolls a random route.
+2:23  Nine algorithms per lane, from BFS to bidirectional A*.
+
+GAME UI: LANDMARKS (2:25)
+2:28  Each lane has a landmark dropdown: Off, 2, 4 or 8.
+2:32  Turn on the Landmarks tool, then click cities to build your own set.
+2:38  The dropdown now reads Custom, with the number of cities you picked.
+
+GAME UI: PLAYBACK (2:41)
+2:44  START runs both lanes. The same button pauses.
+2:48  ◀◀ and ▶▶ step one expansion. Restart rewinds to the beginning.
+2:54  Slide the step delay right for faster playback.
+2:58  When the search finishes, the route lights up and the final stats fill in.
+
+GAME UI: MAP TOGGLES (3:00)
+3:05  Distances labels every road with its length in km.
+3:09  Heatmap colours each city by h: red near the goal, blue far away.
+3:15  Straight Line draws a reference line. Display only.
+3:19  Merge off: map A and map B side by side, with a VS badge between them.
+
+GAME UI: STATS (3:21)
+3:25  Algorithm Comparison: live step, visited and frontier, then cost, path and memory.
+3:32  Scroll down for the complexity and landmark rows.
+
+GAME UI: GUIDE (3:34)
+3:37  The Guide tab explains the algorithms and the heuristic, game-styled.
+
+GAME UI: THEMES (3:42)
+3:43  Four themes: Light, Dark, Space and Dungeons & Dragons.
+
+PHONE (3:51)
+3:51  On a phone, the layout stacks into a single column.
+3:55  Tap a dropdown to pick a city.
+3:58  Pinch with two fingers to zoom, drag with one to pan.
+4:03  Tap START to run the search on the go.
+
+EASTER EGGS (4:06)
+4:07  There are hidden extras. Click the VS badge five times…
+4:18  Toggle Merge, and a cat may peek out. Click it.
+4:22  Step with ▶▶ and a capybara may rise from the map.
+4:27  Roll the dice and a bird may fly in.
+4:30  Click the duck ten times…
+4:39  …and a fifth theme switch unlocks the bread button.
+4:44  Every animal you find waits for you on the Guide page.
+
+WRAP-UP (4:48)
+4:49  That concludes our guide for Pathfinding Project.
+4:52  Thank you!
