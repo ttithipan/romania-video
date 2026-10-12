@@ -194,14 +194,26 @@ while (frontF.length > 0 && frontB.length > 0) {
 }"""
 
 
-ORDER = ['sc_route', 'sc_explore', 'sc_ucsproof', 'sc_estimate', 'sc_twoways', 'sc_lpproof',
-         'sc_triangle', 'sc_landmark', 'sc_max', 'sc_tightness', 'sc_code_search', 'sc_code_astar',
-         'sc_code_bounds', 'sc_code_table', 'sc_code_both', 'sc_race', 'sc_cutwork',
-         'sc_complexity', 'sc_guarantee', 'sc_bothends', 'sc_stop', 'sc_recap']
+ORDER = ['sc_intro', 'sc_route', 'sc_explore', 'sc_ucsproof', 'sc_estimate', 'sc_twoways',
+         'sc_lpproof', 'sc_triangle', 'sc_landmark', 'sc_max', 'sc_tightness',
+         'sc_code_search', 'sc_code_astar', 'sc_code_bounds', 'sc_code_table', 'sc_code_both',
+         'sc_race', 'sc_cutwork', 'sc_complexity', 'sc_guarantee', 'sc_bothends', 'sc_stop',
+         'sc_recap', 'sc_outro']
 # The film runs without mascots — the whole film is one layout tier. Add sprite
 # names here (e.g. ['Whale']) to bring the cast back for every scene at once.
 CAST = []
 
+# Title-card cast: (short name, student ID, sprite stem), in student-ID order.
+# `_speaker` covers the one-or-two corner mascots; the title card needs the whole
+# team on one row, so it reads this list instead. Sprites are character/cast_<stem>.png.
+TEAM = [
+    ('Napaul',     '67011178', 'Duck'),
+    ('Nuttawee',   '67011214', 'Capy'),
+    ('Pacharapol', '67011220', 'Cat'),
+    ('Pavikan',    '67011246', 'Bread'),
+    ('Mind',       '67011594', 'Bird'),
+    ('Tithipan',   '67011671', 'Whale'),
+]
 
 class Film(Scene):
     K = 1.3       # global slowdown factor for animations
@@ -358,6 +370,50 @@ class Film(Scene):
         if cast:
             self.play(*[FadeIn(m) for m in cast], run_time=0.5)
 
+    def _lineup(self, h=0.92, ys=(-1.5, -2.45, -2.95), sizes=(19, 13), x0=-5.0, dx=2.0):
+        """The whole team on one row: mascot, short name, student ID.
+
+        `_speaker` only has two corner slots, so the title card gets its own row
+        spread across the content width. The idle bob is phase-offset per column
+        — six mascots breathing in unison reads as mechanical. Returns
+        `(sprites, names)` so the caller can stagger the entrance.
+        """
+        # plain lists, not VGroup: a VGroup cannot hold an ImageMobject
+        sprites, names = [], []
+
+        def trimmed(path):
+            """Crop a sprite to its visible pixels before scaling.
+
+            `scale_to_fit_height` measures the whole image, transparent margin
+            included, and that margin runs from 8% (the cat) to 44% (the
+            capybara) across this cast — so equal heights still produced a 39%
+            spread in how large the characters actually looked. Cropping first
+            makes "same height" mean the same thing, and because the row shares
+            one centre line, it aligns their feet as well.
+            """
+            from PIL import Image as PILImage
+            im = PILImage.open(path).convert('RGBA')
+            bb = im.getchannel('A').point(lambda v: 255 if v > 8 else 0).getbbox()
+            return np.array(im.crop(bb))
+
+        for i, (short, sid, stem) in enumerate(TEAM):
+            x = x0 + dx * i
+            m = ImageMobject(trimmed(f'{CHAR}/cast_{stem}.png')).set_z_index(20)
+            m.scale_to_fit_height(h).move_to([x, ys[0], 0])
+            base = m.get_center().copy()
+            # STILL=1 freezes the row. The per-mascot phase offset is deliberate
+            # live, but it means no frame of the animated card has the six on a
+            # common line — the best case is ~37px of spread at 1080p, which is
+            # wrong for a thumbnail. Never set during a real render.
+            if not os.environ.get('STILL'):
+                m.add_updater(lambda mm, b=base, p=i * 0.9: mm.move_to(
+                    b + UP * 0.20 * np.sin(self.time * 2.3 + p)
+                    + RIGHT * 0.12 * np.sin(self.time * 3.5 + p)))
+            sprites.append(m)
+            names.append(VGroup(label(short, sizes[0], INK, width=1.85).move_to([x, ys[1], 0]),
+                                label(sid, sizes[1], MUTED).move_to([x, ys[2], 0])))
+        return sprites, names
+
     def sub(self, text):
         s = subtitle(text)
         if self._sub is not None:
@@ -478,6 +534,33 @@ class Film(Scene):
         return d
 
     # ── scenes ────────────────────────────────────────────────────────────────
+    def sc_intro(self):
+        """Title card. Silent by design — no voiceover, no subtitle.
+
+        `beat()` always draws a subtitle (`beat` -> `sub`), so this scene drives
+        `play`/`wait` directly and owns its own holds. It never appends to
+        `_vo_sched`, so the voiced render leaves it silent rather than muxing
+        the wrong clip onto it.
+        """
+        # per-glyph title so each letter can drop in on its own lag
+        rom = VGroup(*[label(ch, 90, INK) for ch in 'ROMANIA']).arrange(RIGHT, buff=0.12)
+        rom.scale_to_fit_width(7.4).move_to([0, 2.5, 0])
+        path = label('PATHFINDING', 60, GOLD).scale_to_fit_width(9.4).move_to([0, 1.1, 0])
+        under = Line([-3.7, 1.85, 0], [3.7, 1.85, 0], color=CYAN, stroke_width=5)
+        rule = Line([-4.7, 0.45, 0], [4.7, 0.45, 0], color=MUTED, stroke_width=2)
+        sprites, names = self._lineup()
+
+        self.wait(0.8)                          # black lead-in
+        self.play(LaggedStart(*[FadeIn(ch, shift=UP * 1.6) for ch in rom], lag_ratio=0.10),
+                  run_time=1.0)
+        self.play(GrowFromCenter(under), run_time=0.45)
+        self.play(FadeIn(path, scale=1.35), run_time=0.45)
+        self.play(GrowFromCenter(rule), run_time=0.35)
+        self.play(LaggedStart(*[FadeIn(m, shift=UP * 0.35) for m in sprites], lag_ratio=0.12),
+                  run_time=1.0)
+        self.play(LaggedStart(*[FadeIn(g) for g in names], lag_ratio=0.12), run_time=0.6)
+        self.wait(1.6)
+
     def sc_route(self):
         self.title('Which route is cheapest?')
         r1 = ['Arad', 'Sibiu', 'Fagaras', 'Bucharest']
@@ -577,7 +660,10 @@ class Film(Scene):
         self.beat("Suppose it chooses a goal too soon.",
                   lambda: self.play(Create(Line(pts[0], pts[2], color=GREEN, stroke_width=5 * S)),
                                     FadeIn(self.token([pts[0], pts[2]], INK)),
-                                    FadeIn(tag('picked first', round(18 * S), GREEN).move_to((pts[0] + pts[2]) / 2 + UP * 0.45 * S)),
+                                    # up-left along the road's normal: a plain UP
+                                    # offset left the label's corner on the line
+                                    FadeIn(tag('picked first', round(18 * S), GREEN).move_to(
+                                        (pts[0] + pts[2]) / 2 + (LEFT * 0.45 + UP * 0.62) * S)),
                                     run_time=0.5))
         self.beat("A cheaper route must remain unfinished.",
                   lambda: self.play(Create(DashedLine(pts[1], pts[2], color=GOLD)),
@@ -691,11 +777,13 @@ class Film(Scene):
             self.add(VGroup(*[Dot(pt[c], radius=0.075, color=INK).set_z_index(5) for c in cities]))
             self.add(label('a', 20, INK).move_to(pt['Arad'] + normal * 0.34),
                      label('b', 20, INK).move_to(pt['Bucharest'] + normal * 0.34),
-                     label('Arad', 17, MUTED).move_to(pt['Arad'] - normal * 0.36),
-                     label('Bucharest', 17, MUTED).move_to(pt['Bucharest'] - normal * 0.36),
-                     # name the intermediate cities: the km labels below are the whole point
+                     # City names share one lane 0.42 below the chord, each pushed
+                     # out by its own city's distance from that line. A flat 0.36
+                     # offset sat Sibiu's name on the chord, because Sibiu itself
+                     # is only 0.39 above it.
                      *[label('Rimnicu V.' if c == 'Rimnicu Vilcea' else c, 17, MUTED)
-                       .move_to(pt[c] - normal * 0.36) for c in cities[1:-1]])
+                       .move_to(pt[c] - normal * (0.42 + np.dot(pt[c] - a, normal)))
+                       for c in cities])
             self.bdot = Dot(b, color=GREEN, radius=0.1).set_z_index(7)
             self.add(chain, kml)
         self.beat("Place the route's road arrows head to tail.", draw)
@@ -734,7 +822,7 @@ class Film(Scene):
             self.add(tag(tag_text, 17, color).move_to(tag_pos))
 
         self.beat("Why use the difference in distances?",
-                  lambda: (edge(L, t, GREEN, 'd(Landmark,target)', (L + t) / 2 + UP * 0.4),
+                  lambda: (edge(L, t, GREEN, 'd(Landmark,target)', (L + t) / 2 + UP * 0.8),
                            self.add(self.token([L, t], GOLD))))
         self.beat("Going via t cannot shorten the shortest path.",
                   lambda: edge(L, n, CYAN, 'd(Landmark,node)', (L + n) / 2 + LEFT * 0.95))
@@ -807,7 +895,7 @@ class Film(Scene):
                      label('d(n,t)', 18, RED).next_to(nb, DOWN, buff=0.08).align_to(nb, LEFT),
                      VGroup(label('|', 24, INK), label('d(L,n)', 24, CYAN), label(' − ', 24, INK),
                             label('d(L,t)', 24, GREEN), label('| ≤ ', 24, INK),
-                            label('d(n,t)', 24, RED)).arrange(RIGHT, buff=0.05).move_to([0.8, 3.05, 0]))
+                            label('d(n,t)', 24, RED)).arrange(RIGHT, buff=0.05).move_to([0.8, 3.6, 0]))
         self.beat("That remainder cannot exceed d(n,t).", compare)
 
     def sc_max(self):
@@ -891,11 +979,10 @@ class Film(Scene):
         scale, x0, span = 6.0 / 11, -3.0, 6.0
 
         def frame():
-            # x axis (nodes explored) + faint grid, so the bars read as a chart
+            # x axis (nodes explored). The faint vertical grid is gone: it spanned
+            # -1.4..1.7 straight through every bar label, and labels may not take
+            # a backing plate (see `tag`), so the decoration had to yield.
             self.play(Create(Line([x0, -1.4, 0], [x0 + span, -1.4, 0], color=INK, stroke_width=3)),
-                      *[Create(Line([x0 + k * scale, -1.4, 0], [x0 + k * scale, 1.7, 0],
-                                    color=MUTED, stroke_width=1).set_opacity(0.35))
-                        for k in range(0, 12)],
                       run_time=0.7)
             self.add(*[Line([x0 + k * scale, -1.3, 0], [x0 + k * scale, -1.5, 0],
                             color=MUTED, stroke_width=2) for k in (0, 5, 10)],
@@ -1258,3 +1345,32 @@ class Film(Scene):
                   lambda: self.play(FadeIn(arrows[1]), FadeIn(cards[2]), FadeIn(caps[2]),
                                     FadeIn(arrows[2]), FadeIn(cards[3]), FadeIn(caps[3]), run_time=0.7))
         self.beat("Five expansions, on the same 418 km route.")
+
+    def sc_outro(self):
+        """Closing card. Silent like `sc_intro` — no voiceover, no subtitle.
+
+        Same reason as the title card: `beat()` always draws a subtitle, and a
+        credits card does not want one. With the subtitle band free, the whole
+        composition is re-centred lower to use it.
+        """
+        self.title('Credits')
+        thanks = label('THANK YOU', 72, INK).scale_to_fit_width(6.6).move_to([0, 2.2, 0])
+        under = Line([-3.3, 1.52, 0], [3.3, 1.52, 0], color=CYAN, stroke_width=5)
+        # closing takeaway, not a repeat of sc_recap's four method cards: this
+        # states what the film delivered, sc_recap states how it got there
+        recap = VGroup(*[
+            card(t, c, w=6.0, h=0.46, size=19)
+            for t, c in (('Three searches, one shortest route.', CYAN),
+                         ('418 km across the Romania road graph.', GOLD),
+                         ('Fewer cities expanded, same answer.', GREEN))
+        ]).arrange(DOWN, buff=0.12).move_to([0, 0.45, 0])
+        sprites, names = self._lineup(h=0.75, ys=(-1.25, -2.05, -2.5), sizes=(18, 13))
+
+        self.wait(0.4)                          # breathe after the previous scene's fade
+        self.play(FadeIn(thanks, scale=1.2), GrowFromCenter(under), run_time=0.7)
+        self.play(LaggedStart(*[FadeIn(c) for c in recap], lag_ratio=0.15), run_time=0.5)
+        self.wait(0.3)
+        self.play(LaggedStart(*[FadeIn(m, shift=UP * 0.3) for m in sprites], lag_ratio=0.10),
+                  run_time=0.9)
+        self.play(LaggedStart(*[FadeIn(g) for g in names], lag_ratio=0.10), run_time=0.6)
+        self.wait(1.8)
